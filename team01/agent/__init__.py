@@ -1,0 +1,1 @@
+"""Shared Bomberman agent components."""
