@@ -6,9 +6,8 @@ sys.path.insert(1, '..')
 # Import necessary stuff
 from game import Game
 
-# TODO This is your code!
-sys.path.insert(1, '../teamNN')
-
+sys.path.insert(1, '../team01')
+from agent.controller import BombermanAgent
 # Uncomment this if you want the empty test character
 #from testcharacter import TestCharacter
 
@@ -18,8 +17,10 @@ from interactivecharacter import InteractiveCharacter
 # Create the game
 g = Game.fromfile('map.txt')
 
-# TODO Add your character
-
+g.add_character(BombermanAgent("me",  # name
+                                "C",  # avatar
+                                0, 0  # position
+))  
 # Uncomment this if you want the test character
 # g.add_character(TestCharacter("me", # name
 #                               "C",  # avatar
@@ -27,10 +28,10 @@ g = Game.fromfile('map.txt')
 # ))
 
 # Uncomment this if you want the interactive character
-g.add_character(InteractiveCharacter("me", # name
-                                     "C",  # avatar
-                                     0, 0  # position
-))
+# g.add_character(InteractiveCharacter("me", # name
+#                                      "C",  # avatar
+#                                      0, 0  # position
+# ))
 
 # Run!
 

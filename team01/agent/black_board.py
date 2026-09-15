@@ -40,6 +40,15 @@ class BlackBoard:
         with self._lock:
             self._data.clear()
 
+    def erase(self, key: str | None = None) -> None:
+        """Erase a specific keys value or all keys values if no key is provided."""
+        with self._lock:
+            if key is None:
+                for k in list(self._data.keys()):
+                    self._data[k] = None
+            elif key in self._data:
+                self._data[key] = None
+
     def keys(self) -> List[str]:
         """Return a list of all keys in the blackboard."""
         with self._lock:

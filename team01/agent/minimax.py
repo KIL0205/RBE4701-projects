@@ -1,0 +1,1 @@
+#generic minimax implementation for decision making in the Bomberman agent
