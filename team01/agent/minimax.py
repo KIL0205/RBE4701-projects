@@ -4,6 +4,7 @@ from team01.agent.actions import AgentAction
 from team01.agent.black_board import BlackBoardValue
 
 # TODO: most typing is temporary
+# TODO: test & double check depth limiting
 # TODO: might want to pass around [v, state], where <state> is the closest state 
 #       that leads to v, so it's easier to identify it later
 
@@ -19,7 +20,7 @@ class Minimax():
     
     ### Minimax Functions
     def minimax(self, state) -> AgentAction:
-        '''executes the minimax function on the given graph and returns an action'''
+        """ Executes the minimax function on the given graph and returns an action """
         self.curr_depth = 0 # initialize current depth, alpha, and beta
         alpha = -math.inf
         beta  =  math.inf
@@ -29,12 +30,14 @@ class Minimax():
     def max_val(self, state, alpha: float, beta: float): # returns a utility value (optimal cell)
         """ Returns the maximum value possible to achieve from the actions available for state """
         
+        depth += 1 # increment depth
+        
         if self.terminal_test(state):
             return self.utility(state)
         
         # depth restricting
-        if self.curr_depth == self.max_depth: # TODO: update with whatever the actual return val is here lol
-            return self.utility(state)
+        if self.curr_depth == self.max_depth:
+            return self.utility(state) # TODO: update with whatever the actual return val is here lol
         
         v = - math.inf
         
@@ -49,6 +52,8 @@ class Minimax():
 
     def min_val(self, state, alpha: float, beta: float): # returns a utility value (optimal cell)
         """ Returns the minimum value possible to achieve from the actions available for state """
+        
+        depth += 1 # increment depth
         
         if self.terminal_test(state):
             return self.utility(state)
