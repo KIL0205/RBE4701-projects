@@ -2,6 +2,7 @@ import math
 from typing import Dict, List
 from team01.agent.actions import AgentAction
 from team01.agent.black_board import BlackBoardValue
+from team01.agent.world_model import WorldModel
 
 # TODO: most typing is temporary
 # TODO: test & double check depth limiting
@@ -14,12 +15,19 @@ class AdversarialSearch():
     with a graph to search, as well as a depth limit. If no depth limit is set, the search is not depth limited.
     """
     
-    def __init__(self, graph, depth: int = math.inf) -> None:
-        self.graph = graph
+    ### Class Functions ------------------------------------------------------------------------
+    def __init__(self, world, depth: float = math.inf) -> None:
+        self.graph = world
         self.max_depth = depth
         self.curr_depth = 0
         
-    ### Expectimax Functions
+    def set_world(self, world) -> None:
+        self.graph = world
+        
+    def set_max_depth(self, depth: float = math.inf) -> None:
+        self.max_depth = depth
+        
+    ### Expectimax Functions -------------------------------------------------------------------
     def expectimax(self, state) -> AgentAction:
         """ 
         Generic expectimax implementation for decision making in the Bomberman agent. Executes 
@@ -66,7 +74,7 @@ class AdversarialSearch():
         return v
         
     
-    ### Minimax Functions
+    ### Minimax Functions ----------------------------------------------------------------------
     def minimax(self, state) -> AgentAction:
         """ 
         Generic minimax implementation with alpha-beta pruning for decision making in the Bomberman agent. Executes 
@@ -124,7 +132,7 @@ class AdversarialSearch():
         return v
     
     
-    ### Supporting Functions
+    ### Supporting Functions -------------------------------------------------------------------
     def probability(self, a) -> float: # a is not an agent action, but an opponent action
         return 0.0 # TODO: update placeholder value
     
@@ -138,6 +146,7 @@ class AdversarialSearch():
     def actions(self, s) -> List[AgentAction]: # TODO: update with actual method for getting possible actions from a state
         """ Returns a list of all possible actions for the given state """
         return [AgentAction(0,0,False)]
+        # return graph.neighbors(s) ## if directly traversing the world
         
         
     def result(self, s, a: AgentAction): # TODO: update with actual method of getting the result of taking an action a at state
