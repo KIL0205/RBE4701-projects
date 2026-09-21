@@ -8,7 +8,7 @@ from agent.behavior_tree import ActionNode, ConditionNode, SelectorNode, Sequenc
 from agent.black_board import BlackBoard
 from agent.blackboard_keys import BBKeys
 from agent.world_model import WorldModel
-
+import navigation
 
 class IsImmediateDanger(ConditionNode):
     def __init__(self, blackboard):
@@ -20,7 +20,43 @@ class IsImmediateDanger(ConditionNode):
             return Status.FAILURE
 
         self.blackboard.set(BBKeys.DEBUG_INFO, {"active_behavior": "IsImmediateDanger"})
-        # TODO: Implement the logic for checking if immediate danger exists.
+        # Immediate danger: monster within 1 of 8 neighbor tiles
+        #                   bomb within 4 range of NSEW without wall [could be improved to remember when bomb was placed]
+        
+        cx, cy = WorldModel.self_position
+        
+        for monster in WorldModel.monster_positions:
+            mx, my = monster
+            if (abs(mx - cx) <= 1) and (abs(my - cy) <= 1):
+                return Status.SUCCESS
+    
+        for bomb in WorldModel.bomb_positions:
+            bx, by = bomb
+            # Bomb W
+            if 0 < cx - bx <= 4:
+                for dif in range(1,4):
+                    if WorldModel.is_wall(cx + dif, cy):
+                        break
+                return Status.SUCCESS
+            # Bomb E
+            elif 0 < bx - cx <= 4:
+                for dif in range(1,4):
+                    if WorldModel.is_wall(cx - dif, cy):
+                        break
+                return Status.SUCCESS
+            # Bomb N
+            elif 0 < by - cy <= 4:
+                for dif in range(1,4):
+                    if WorldModel.is_wall(cx, cy + dif):
+                        break
+                return Status.SUCCESS
+            # Bomb S
+            elif 0 < cy - by <= 4:
+                for dif in range(1,4):
+                    if WorldModel.is_wall(cx, cy - dif):
+                        break
+                return Status.SUCCESS
+            
         return Status.FAILURE
         
 class ChooseSafeMove(ActionNode):
@@ -33,7 +69,24 @@ class ChooseSafeMove(ActionNode):
             return Status.FAILURE
 
         self.blackboard.set(BBKeys.DEBUG_INFO, {"active_behavior": "ChooseSafeMove"})
-        # TODO: Implement the logic for choosing a safe move.
+        # TODO: Implement the logic for choosing a safe move. : Blackboard confusion, 
+        # I think should use threat cells to determine the about-to-boom cells between bombs and walls. [meeting Q]
+        unsafe_cells = []
+       
+        monsters = WorldModel.monster_positions
+        unsafe_cells.extend(monsters)
+
+        neighbors = WorldModel.neighbors(WorldModel.self_position)
+        safe_cells = neighbors
+        for node in neighbors:
+            for monster in monsters:
+                for badnode in WorldModel.neighbors(monster):
+                    if node == badnode:
+                        safe_cells.remove(node)
+        if safe_cells:
+            self.blackboard.set(BBKeys.SAFE_ACTIONS, {"safe_actions": safe_cells})
+            return Status.SUCCESS
+        
         return Status.FAILURE
 
 class IsDangerSoon(ConditionNode):
@@ -46,6 +99,8 @@ class IsDangerSoon(ConditionNode):
             return Status.FAILURE
 
         # TODO: Implement the logic for checking if danger is imminent.
+        # Should this be checking escape routes if an enemy entered our area perhaps?
+        # Flee squares should a bomb be planted by the enemy?
         return Status.FAILURE
     
 class AvoidThreat(ActionNode):
@@ -58,7 +113,8 @@ class AvoidThreat(ActionNode):
             return Status.FAILURE
 
         self.blackboard.set(BBKeys.DEBUG_INFO, {"active_behavior": "AvoidThreat"})
-        # TODO: Implement the logic for avoiding potential threats.
+        # TODO: Implement the logic for avoiding potential threats. A* should be doing this already, 
+        # maybe I should break it out into multiple fragments to place some here instead. [bringup at meeting]
         return Status.FAILURE
     
 class NavigateToExit(ActionNode):
@@ -71,7 +127,11 @@ class NavigateToExit(ActionNode):
             return Status.FAILURE
 
         self.blackboard.set(BBKeys.DEBUG_INFO, {"active_behavior": "NavigateToExit"})
-        # TODO: Implement the logic for navigating to the exit.
+        A_star_path = navigation.find_path(WorldModel, WorldModel.self_position, WorldModel.exit_position)
+        if A_star_path:
+            self.blackBoard.set(BBKeys.PLANNED_PATH ,{"planned_path": A_star_path})
+            return Status.SUCCESS
+        
         return Status.FAILURE
 
 class IsExitBlocked(ConditionNode):
@@ -83,7 +143,8 @@ class IsExitBlocked(ConditionNode):
         if model is None or model.exit_position is None or model.self_position is None:
             return Status.FAILURE
 
-        # TODO: Implement the logic for checking if the exit is blocked.
+        if (navigation.find_path(WorldModel, WorldModel.self_position, WorldModel.exit_position) == []) and (WorldModel.self_position != WorldModel.exit_position):
+            return Status.SUCCESS
         return Status.FAILURE
 
 class ExplodeWall(ActionNode):

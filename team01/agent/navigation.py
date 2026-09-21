@@ -21,6 +21,7 @@ def find_path(model: WorldModel, start: Position, goal: Position) -> List[Positi
     came_from[start] = None
     cost_so_far[start] = 0
     gx, gy = goal
+    monster_worry = 1
     
     frontier = []
     heapq.heappush(frontier, (0,start))
@@ -50,11 +51,16 @@ def find_path(model: WorldModel, start: Position, goal: Position) -> List[Positi
             new_cost = cost_so_far[curr] + travel
             if node not in cost_so_far or new_cost < cost_so_far[node]:
                 cost_so_far[node] = new_cost
+                
+                # Distance to each monster from node
+                monster_dist = 0
+                for mx, my in model.monster_positions:
+                    monster_dist = 1/(math.sqrt((mx-nx)**2 + (my-ny)**2)) + monster_dist
                 # Priority is for the frontier heapq; 
-                # The cost to reach node + the straight-line distance to the goal from node
-                priority = new_cost + math.sqrt((gx-nx)**2 + (gy-ny)**2)
+                # The cost to reach node + the straight-line distance to the goal from node + monster priority
+                priority = new_cost + math.sqrt((gx-nx)**2 + (gy-ny)**2) + (monster_dist * monster_worry)
                 heapq.heappush(frontier, (priority,node))
                 # We went to node from curr (best option)
                 came_from[node] = curr
-    print("Something unexpected happened in A*")        
-    return []
+    print("Exit is blocked")
+    return [] # Tuple[-math.inf, math.inf]
