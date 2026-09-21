@@ -1,16 +1,16 @@
 import heapq
 from typing import List, Set, Tuple
-
+import math
 from .world_model import WorldModel
 
 Position = Tuple[int, int]
 
 
 def _heuristic(a: Position, b: Position) -> float:
-    """Estimate remaining path cost using diagonal grid distance."""
+    """Estimate remaining total euclidean distance"""
     ax, ay = a
     bx, by = b
-    return max(abs(bx - ax), abs(by - ay))
+    return math.sqrt((bx-ax)**2 + (by-ay)**2)
 
 
 def find_path(
@@ -46,7 +46,12 @@ def find_path(
         for neighbor in model.neighbors(current):
             if neighbor in forbidden and neighbor != goal:
                 continue
-            new_cost = cost_so_far[current] + 1
+            nx, ny = neighbor
+            cx, cy = current
+            travel = math.sqrt(2)
+            if ((abs(nx - cx) == 1) and (abs(ny - cy) == 0)) or ((abs(nx - cx) == 0) and (abs(ny - cy) == 1)):
+                travel = 1
+            new_cost = cost_so_far[current] + travel
             if neighbor not in cost_so_far or new_cost < cost_so_far[neighbor]:
                 cost_so_far[neighbor] = new_cost
                 priority = new_cost + _heuristic(neighbor, goal)

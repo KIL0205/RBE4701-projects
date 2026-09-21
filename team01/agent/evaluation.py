@@ -130,6 +130,7 @@ def measure_exit_progress(model: WorldModel, position: Position) -> float:
     if model.exit_position is None or model.self_position is None:
         return 0.0
     old_path = find_path(model, model.self_position, model.exit_position)
+    
     new_path = find_path(model, position, model.exit_position)
     if not new_path:
         return -float(max(1, model.width * model.height))
