@@ -3,21 +3,34 @@ from typing import Dict, List, Optional, Set, Tuple
 
 Position = Tuple[int, int]
 
+
 @dataclass
 class WorldModel:
     width: int
     height: int
+    bomb_time: int = -1
+    explosion_duration: int = -1
+    explosion_range: int = -1
     exit_position: Optional[Position] = None
     self_position: Optional[Position] = None
     walls: Set[Position] = field(default_factory=set)
     bombs: Set[Position] = field(default_factory=set)
+    bomb_timers: Dict[Position, int] = field(default_factory=dict)
     explosions: Set[Position] = field(default_factory=set)
+    explosion_timers: Dict[Position, int] = field(default_factory=dict)
     monsters: Set[Position] = field(default_factory=set)
     characters: Dict[str, Position] = field(default_factory=dict)
 
     @classmethod
     def from_sensed_world(cls, wrld) -> "WorldModel":
-        model = cls(wrld.width(), wrld.height())
+        """Build a current factual snapshot from the sensed framework world."""
+        model = cls(
+            wrld.width(),
+            wrld.height(),
+            bomb_time=wrld.bomb_time,
+            explosion_duration=wrld.expl_duration,
+            explosion_range=wrld.expl_range,
+        )
 
         for x in range(wrld.width()):
             for y in range(wrld.height()):
@@ -37,11 +50,15 @@ class WorldModel:
             for m in monsterList:
                 model.monsters.add((m.x, m.y))
 
-        for k, b in wrld.bombs.items():
-            model.bombs.add((b.x, b.y))
+        for bomb in wrld.bombs.values():
+            position = (bomb.x, bomb.y)
+            model.bombs.add(position)
+            model.bomb_timers[position] = bomb.timer
 
-        for k, e in wrld.explosions.items():
-            model.explosions.add((e.x, e.y))
+        for explosion in wrld.explosions.values():
+            position = (explosion.x, explosion.y)
+            model.explosions.add(position)
+            model.explosion_timers[position] = explosion.timer
 
         return model
 

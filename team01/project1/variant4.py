@@ -13,7 +13,7 @@ from testcharacter import TestCharacter
 from agent.controller import BombermanAgent
 
 # Create the game
-random.seed(random.randint(0, 1000))
+random.seed()
 g = Game.fromfile('map.txt')
 g.add_monster(SelfPreservingMonster("aggressive", # name
                                     "A",          # avatar

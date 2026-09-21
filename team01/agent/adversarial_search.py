@@ -38,7 +38,7 @@ class AdversarialSearch():
         
     def exp_val(self, state): # returns a utility value
         """ Returns the expected value of a node/state, using expectimax search. """
-        depth += 1 # increment depth
+        self.curr_depth += 1 # increment depth
                 
         if self.terminal_test(state):
             return self.utility(state)
@@ -51,13 +51,13 @@ class AdversarialSearch():
         
         for a in self.actions(state): # update v to max value of possible actions, pruning if necessary
             p = self.probability(a)
-            v = v + p * max_val_exp(self.result(state, a))
+            v = v + p * self.max_val_exp(self.result(state, a))
             
         return v
     
     def max_val_exp(self, state): # returns a utility value
         """ Returns the maximum value possible to achive from the actions available for the state, using expectimax search. """
-        depth += 1 # increment depth
+        self.curr_depth += 1 # increment depth
         
         if self.terminal_test(state):
             return self.utility(state)
@@ -89,7 +89,7 @@ class AdversarialSearch():
     def max_val(self, state, alpha: float, beta: float): # returns a utility value (optimal cell)
         """ Returns the maximum value possible to achieve from the actions available for state """
         
-        depth += 1 # increment depth
+        self.curr_depth += 1 # increment depth
         
         if self.terminal_test(state):
             return self.utility(state)
@@ -101,7 +101,7 @@ class AdversarialSearch():
         v = - math.inf
         
         for a in self.actions(state): # update v to max value of possible actions, pruning if necessary
-            v = max(v, self.min_val(self.result(state, a), a))
+            v = max(v, self.min_val(self.result(state, a), alpha, beta))
             if v >= beta:
                 return v
             alpha = max(alpha, v)
@@ -112,7 +112,7 @@ class AdversarialSearch():
     def min_val(self, state, alpha: float, beta: float): # returns a utility value (optimal cell)
         """ Returns the minimum value possible to achieve from the actions available for state """
         
-        depth += 1 # increment depth
+        self.curr_depth += 1 # increment depth
         
         if self.terminal_test(state):
             return self.utility(state)
@@ -124,7 +124,7 @@ class AdversarialSearch():
         v = math.inf
         
         for a in self.actions(state): 
-            v = min(v, self.max_val(self.result(state, a), a)) 
+            v = min(v, self.max_val(self.result(state, a), alpha, beta)) 
             if v <= alpha:
                 return v
             beta = min(beta, v)

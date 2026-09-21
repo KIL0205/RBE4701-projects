@@ -11,8 +11,11 @@ class BBKeys:
 
     DANGER_CELLS = "danger_cells"
     MONSTER_THREAT_CELLS = "monster_threat_cells"
+    MONSTER_T2_THREAT_CELLS = "monster_t2_threat_cells"
 
     EXPLOSION_CELLS = "explosion_cells"
     THREAT_CELLS = "threat_cells"
 
     DEBUG_INFO = "debug_info"
+    EVALUATION_BREAKDOWNS = "evaluation_breakdowns"
+    CANDIDATE_SAFETY = "candidate_safety"

@@ -1,60 +1,76 @@
-from typing import List, Tuple
-
-from agent.world_model import WorldModel
-
 import heapq
-import math
+from typing import List, Set, Tuple
+
+from .world_model import WorldModel
 
 Position = Tuple[int, int]
 
 
-def find_path(model: WorldModel, start: Position, goal: Position) -> List[Position]:
+def _heuristic(a: Position, b: Position) -> float:
+    """Estimate remaining path cost using diagonal grid distance."""
+    ax, ay = a
+    bx, by = b
+    return max(abs(bx - ax), abs(by - ay))
+
+
+def find_path(
+    model: WorldModel,
+    start: Position,
+    goal: Position,
+    forbidden_cells: Set[Position] | None = None,
+) -> List[Position]:
+    """Return an A* path including both the start and goal positions."""
+    forbidden = forbidden_cells or set()
+    if not model.in_bounds(start) or not model.in_bounds(goal):
+        return []
+    if model.is_wall(start) or model.is_wall(goal):
+        return []
     if start == goal:
-        print("start same as goal")
-        return []
-    if model.neighbors[start] == []:
-        print("Nowhere to traverse")
-        return []
+        return [start]
 
-    came_from = set()
-    cost_so_far = set()
-    came_from[start] = None
-    cost_so_far[start] = 0
-    gx, gy = goal
-    
+    came_from = {start: None}
+    cost_so_far = {start: 0}
     frontier = []
-    heapq.heappush(frontier, (0,start))
+    heapq.heappush(frontier, (_heuristic(start, goal), start))
     while frontier:
-        prio, curr = heapq.heappop(frontier)
+        _, current = heapq.heappop(frontier)
 
-        # Path reconstruction
-        if curr == goal:
-            A_star_path = []
-            while came_from[curr] != None:
-                A_star_path.insert(0,curr)
-                curr = came_from[curr]
-            print("A* path generated")
-            return A_star_path
+        if current == goal:
+            path = []
+            while current is not None:
+                path.append(current)
+                current = came_from[current]
+            path.reverse()
+            return path
 
-        # Using neighbors to grab traversable tiles (In-bounds, Not wall, Not bomb)
-        # Will need future updates to assign weight to walls instead
-        neighbors = model.neighbors[curr]
-        for node in neighbors:
-            # Sets the travel distance to the neighbor as the cost
-            cx, cy = curr
-            nx, ny = node
-            travel = math.sqrt(2)
-            if ((abs(nx - cx) == 1) and (abs(ny - cy) == 0)) or ((abs(nx - cx) == 0) and (abs(ny - cy) == 1)):
-                travel = 1
-            # Updates to total costand checks if the node is worth visiting from here
-            new_cost = cost_so_far[curr] + travel
-            if node not in cost_so_far or new_cost < cost_so_far[node]:
-                cost_so_far[node] = new_cost
-                # Priority is for the frontier heapq; 
-                # The cost to reach node + the straight-line distance to the goal from node
-                priority = new_cost + math.sqrt((gx-nx)**2 + (gy-ny)**2)
-                heapq.heappush(frontier, (priority,node))
-                # We went to node from curr (best option)
-                came_from[node] = curr
-    print("Something unexpected happened in A*")        
+        for neighbor in model.neighbors(current):
+            if neighbor in forbidden and neighbor != goal:
+                continue
+            new_cost = cost_so_far[current] + 1
+            if neighbor not in cost_so_far or new_cost < cost_so_far[neighbor]:
+                cost_so_far[neighbor] = new_cost
+                priority = new_cost + _heuristic(neighbor, goal)
+                heapq.heappush(frontier, (priority, neighbor))
+                came_from[neighbor] = current
     return []
+
+def measure_mobility(
+    model: WorldModel,
+    position: Position,
+    num_steps: int,
+    forbidden_cells: Set[Position] | None = None,
+) -> int:
+    """Count distinct positions reachable within ``num_steps`` moves."""
+    forbidden = forbidden_cells or set()
+    visited = {position}
+    frontier = [(position, 0)]
+    while frontier:
+        current, steps = frontier.pop(0)
+        if steps < num_steps:
+            for neighbor in model.neighbors(current):
+                if neighbor in forbidden:
+                    continue
+                if neighbor not in visited:
+                    visited.add(neighbor)
+                    frontier.append((neighbor, steps + 1))
+    return len(visited) - 1  # exclude the starting position
