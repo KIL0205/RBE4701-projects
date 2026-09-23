@@ -10,7 +10,9 @@ def _heuristic(a: Position, b: Position) -> float:
     """Estimate remaining path cost using diagonal grid distance."""
     ax, ay = a
     bx, by = b
-    return max(abs(bx - ax), abs(by - ay))
+    # return max(abs(bx - ax), abs(by - ay))
+    # euclidean distance
+    return ((bx - ax) ** 2 + (by - ay) ** 2) ** 0.5
 
 
 def find_path(
@@ -46,7 +48,7 @@ def find_path(
         for neighbor in model.neighbors(current):
             if neighbor in forbidden and neighbor != goal:
                 continue
-            new_cost = cost_so_far[current] + 1
+            new_cost = cost_so_far[current] + _heuristic(current, neighbor)
             if neighbor not in cost_so_far or new_cost < cost_so_far[neighbor]:
                 cost_so_far[neighbor] = new_cost
                 priority = new_cost + _heuristic(neighbor, goal)

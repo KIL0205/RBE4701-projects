@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Iterable, Set
+from typing import Iterable, Mapping, Set
 
 from .actions import AgentAction
 from .navigation import find_path, measure_mobility
@@ -64,6 +64,29 @@ FALLBACK = EvaluationProfile(
     future_trap_risk_weight=25.0,
     wait_penalty=6.0,
 )
+
+DEFAULT_PROFILES = {
+    "normal": NORMAL_NAVIGATION,
+    "emergency": EMERGENCY_ESCAPE,
+    "fallback": FALLBACK,
+}
+
+
+def profiles_from_mapping(
+    weights: Mapping[str, Mapping[str, float]] | None = None,
+) -> dict[str, EvaluationProfile]:
+    """Build evaluation profiles, overriding only supplied in-memory weights."""
+    profiles = dict(DEFAULT_PROFILES)
+    if weights is None:
+        return profiles
+    for profile_name, values in weights.items():
+        if profile_name not in profiles:
+            raise ValueError(f"unknown evaluation profile: {profile_name}")
+        profile_values = {field: float(value) for field, value in values.items()}
+        profiles[profile_name] = EvaluationProfile(
+            **{**profiles[profile_name].__dict__, **profile_values}
+        )
+    return profiles
 
 
 @dataclass(frozen=True)

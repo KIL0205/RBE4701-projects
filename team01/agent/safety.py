@@ -68,6 +68,43 @@ def monster_reachable_layers(model) -> tuple[Set[Position], Set[Position]]:
     return layers
 
 
+def short_horizon_survivability(model, position: Position, depth: int = 2) -> int:
+    """Count safe positions reachable over the next few movement steps."""
+    _, second_step = monster_reachable_layers(model)
+    threat_layers = [second_step]
+    frontier = set(second_step)
+
+    # Extend the conservative monster threat envelope for the player search.
+    for _ in range(depth - 1):
+        next_frontier: Set[Position] = set()
+        for cell in frontier:
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    candidate = (cell[0] + dx, cell[1] + dy)
+                    if model.in_bounds(candidate) and not model.is_wall(candidate):
+                        next_frontier.add(candidate)
+        frontier = next_frontier
+        threat_layers.append(frontier)
+
+    player_frontier = {position}
+    for threat in threat_layers:
+        next_positions: Set[Position] = set()
+        for current in player_frontier:
+            candidates = [current] + model.neighbors(current)
+            for candidate in candidates:
+                if candidate in threat:
+                    continue
+                if candidate in model.bombs or candidate in model.explosions:
+                    continue
+                next_positions.add(candidate)
+
+        player_frontier = next_positions
+        if not player_frontier:
+            return 0
+
+    return len(player_frontier)
+
+
 def assess_immediate_safety(model, action: AgentAction) -> ImmediateSafetyResult:
     """Check survival through the next monster and character update.
 

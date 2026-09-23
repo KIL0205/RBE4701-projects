@@ -17,15 +17,14 @@ from .safety import (
     monster_immediate_reachable_cells,
     monster_reachable_layers,
     safety_result_dict,
+    short_horizon_survivability,
 )
 from .navigation import find_path
 from .evaluation import (
-    EMERGENCY_ESCAPE,
-    FALLBACK,
-    NORMAL_NAVIGATION,
     bomb_blast_cells,
     evaluate_action,
     immediate_lethal_positions,
+    profiles_from_mapping,
     rank_actions,
 )
 
@@ -52,8 +51,9 @@ class IsImmediateDanger(ConditionNode):
         
 class ChooseSafeMove(ActionNode):
     """Choose the highest-scoring action after immediate safety filtering."""
-    def __init__(self, blackboard):
+    def __init__(self, blackboard, profile):
         super().__init__("choose_safe_move", blackboard)
+        self.profile = profile
 
     def tick(self):
         model = self.blackboard.get(BBKeys.WORLD_MODEL)
@@ -67,7 +67,7 @@ class ChooseSafeMove(ActionNode):
         safety_results = [assess_immediate_safety(model, action) for action in legal]
         eligible = [result.action for result in safety_results if result.eligible]
         safe = filter_safe_actions(model, eligible, danger)
-        rankings = rank_actions(model, eligible, EMERGENCY_ESCAPE)
+        rankings = rank_actions(model, eligible, self.profile)
 
         self.blackboard.set(BBKeys.POSSIBLE_ACTIONS, legal)
         self.blackboard.set(BBKeys.SAFE_ACTIONS, safe)
@@ -123,8 +123,9 @@ class IsDangerSoon(ConditionNode):
     
 class AvoidThreat(ActionNode):
     """Choose an eligible action using the emergency evaluation profile."""
-    def __init__(self, blackboard):
+    def __init__(self, blackboard, profile):
         super().__init__("avoid_threat", blackboard)
+        self.profile = profile
 
     def tick(self):
         model = self.blackboard.get(BBKeys.WORLD_MODEL)
@@ -136,7 +137,7 @@ class AvoidThreat(ActionNode):
         safety_results = [assess_immediate_safety(model, action) for action in legal]
         eligible = [result.action for result in safety_results if result.eligible]
         _, future_danger = monster_reachable_layers(model)
-        rankings = rank_actions(model, eligible, EMERGENCY_ESCAPE)
+        rankings = rank_actions(model, eligible, self.profile)
         self.blackboard.set(BBKeys.EVALUATION_BREAKDOWNS, rankings)
         self.blackboard.set(BBKeys.MONSTER_T2_THREAT_CELLS, future_danger)
         self.blackboard.set(
@@ -151,8 +152,9 @@ class AvoidThreat(ActionNode):
     
 class NavigateToExit(ActionNode):
     """Use A* for route context, then avoid an unsafe or risky next step."""
-    def __init__(self, blackboard):
+    def __init__(self, blackboard, profile):
         super().__init__("navigate_to_exit", blackboard)
+        self.profile = profile
 
     def tick(self):
         model = self.blackboard.get(BBKeys.WORLD_MODEL)
@@ -191,13 +193,26 @@ class NavigateToExit(ActionNode):
         eligible = [result.action for result in safety_results if result.eligible]
         path_result = assess_immediate_safety(model, action)
         if not path_result.eligible:
-            rankings = rank_actions(model, eligible, NORMAL_NAVIGATION)
+            rankings = rank_actions(model, eligible, self.profile)
         else:
-            path_score = evaluate_action(model, action, NORMAL_NAVIGATION)
-            if path_score.future_monster_risk == 0 and path_score.future_trap_risk == 0:
+            path_score = evaluate_action(model, action, self.profile)
+            path_survivability = short_horizon_survivability(model, path_score.destination)
+            if (
+                path_score.future_monster_risk == 0
+                and path_score.future_trap_risk == 0
+                and path_survivability > 0
+            ):
                 rankings = [path_score]
             else:
-                rankings = rank_actions(model, eligible, NORMAL_NAVIGATION)
+                safer_actions = []
+                for candidate in eligible:
+                    candidate_position = (
+                        model.self_position[0] + candidate.dx,
+                        model.self_position[1] + candidate.dy,
+                    )
+                    if short_horizon_survivability(model, candidate_position) > 0:
+                        safer_actions.append(candidate)
+                rankings = rank_actions(model, safer_actions or eligible, self.profile)
         self.blackboard.set(BBKeys.EVALUATION_BREAKDOWNS, rankings)
         best = next((result for result in rankings if not result.lethal), None)
         if best is None:
@@ -236,8 +251,9 @@ class ExplodeWall(ActionNode):
 
 class FindSafeFallback(ActionNode):
     """Choose the best immediately safe action when normal navigation fails."""
-    def __init__(self, blackboard):
+    def __init__(self, blackboard, profile):
         super().__init__("find_safe_fallback", blackboard)
+        self.profile = profile
 
     def tick(self):
         model = self.blackboard.get(BBKeys.WORLD_MODEL)
@@ -248,7 +264,7 @@ class FindSafeFallback(ActionNode):
         legal = legal_candidate_actions(model)
         safety_results = [assess_immediate_safety(model, action) for action in legal]
         eligible = [result.action for result in safety_results if result.eligible]
-        rankings = rank_actions(model, eligible, FALLBACK)
+        rankings = rank_actions(model, eligible, self.profile)
         self.blackboard.set(BBKeys.EVALUATION_BREAKDOWNS, rankings)
         self.blackboard.set(
             BBKeys.CANDIDATE_SAFETY,
@@ -276,7 +292,7 @@ class Wait(ActionNode):
 
 
 class RootController:
-    def __init__(self, blackboard):
+    def __init__(self, blackboard, profiles):
         self.blackboard = blackboard
         self.root = SelectorNode("root", blackboard)
 
@@ -284,18 +300,18 @@ class RootController:
         safety_selector = SelectorNode("safety_selector", blackboard)
         imediate_danger_branch = SequenceNode("immediate_danger", blackboard)
         imediate_danger_branch.add_child(IsImmediateDanger(blackboard))
-        imediate_danger_branch.add_child(ChooseSafeMove(blackboard))
+        imediate_danger_branch.add_child(ChooseSafeMove(blackboard, profiles["emergency"]))
 
         future_danger_branch = SequenceNode("future_danger", blackboard)
         future_danger_branch.add_child(IsDangerSoon(blackboard))
-        future_danger_branch.add_child(AvoidThreat(blackboard))
+        future_danger_branch.add_child(AvoidThreat(blackboard, profiles["emergency"]))
 
         safety_selector.add_child(imediate_danger_branch)
         safety_selector.add_child(future_danger_branch)
 
         #navigation branch
         navigation_seq = SequenceNode("navigation_seq", blackboard)
-        navigation_seq.add_child(NavigateToExit(blackboard))
+        navigation_seq.add_child(NavigateToExit(blackboard, profiles["normal"]))
 
         #fallback branch for handling situations when no other actions are possible
         fallback_selector = SelectorNode("fallback_selector", blackboard)
@@ -303,7 +319,7 @@ class RootController:
         explosion_sequence.add_child(IsExitBlocked(blackboard))
         explosion_sequence.add_child(ExplodeWall(blackboard))
         fallback_selector.add_child(explosion_sequence)
-        fallback_selector.add_child(FindSafeFallback(blackboard))
+        fallback_selector.add_child(FindSafeFallback(blackboard, profiles["fallback"]))
         fallback_selector.add_child(Wait(blackboard))
 
         self.root.add_child(safety_selector)
@@ -315,10 +331,11 @@ class RootController:
 
 
 class BombermanAgent(CharacterEntity):
-    def __init__(self, name, avatar, x, y):
+    def __init__(self, name, avatar, x, y, weights=None):
         super().__init__(name, avatar, x, y)
         self.blackboard = BlackBoard()
-        self.root = RootController(self.blackboard)
+        self.evaluation_profiles = profiles_from_mapping(weights)
+        self.root = RootController(self.blackboard, self.evaluation_profiles)
 
     def do(self, wrld):
         model = WorldModel.from_sensed_world(wrld)
