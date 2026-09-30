@@ -4,7 +4,7 @@ import json
 
 from Bomberman.entity import CharacterEntity
 from world_model import Position, WorldModel
-from evaluation import immediate_lethal_positions, monster_immediate_cells, bomb_blast_cells
+from evaluation import evaluate_position, QLEARNING
 import navigation
 
 class QAgent(CharacterEntity):
@@ -21,57 +21,23 @@ class QAgent(CharacterEntity):
         # TODO: Implement the action selection and execution logic for the agent's turn
         pass
 
-    def features(model: WorldModel) -> Dict[str, float]:
-        features = {"distanceToGoal": None,
-                    "distanceToEnemy": None,
-                    "inBombDanger": None,
-                    "mobility": None
-                    }
-        
-        sx, sy = WorldModel.self_position
-        num_steps = 2
+    def features(model: WorldModel) -> Dict[str, float | bool]:
+        features = evaluate_position(model, model.self_position, QLEARNING)
+        """
+        "exit_progress",
+        "mobility",
+        "escape_options",
+        "monster_threat",
+        "bomb_threat",
+        "explosion_threat",
+        "trap_risk",
+        "future_monster_risk",
+        "future_escape_options",
+        "future_trap_risk",
+        "lethal",
+        """
+        return features
 
-        # Distance to goal feature (could be changed to goal progress 1/x)
-        if WorldModel.exit_position:
-            gx, gy = WorldModel.exit_position
-            features["distanceToGoal"] = ((gx - sx) ** 2 + (gy - sy) ** 2) ** 0.5
-
-        # Total distance to monsters
-        if WorldModel.monsters:
-            mDist = 0
-            for mx, my in WorldModel.monster_positions:
-                mDist = mDist + ((mx - sx) ** 2 + (my - sy) ** 2) ** 0.5
-            features["distanceToEnemy"] = mDist
-
-        # In explosion range of bomb
-        if WorldModel.bombs:
-            for bx, by in WorldModel.bomb_positions:
-                dx = abs(sx - bx)
-                dy = abs(sy - by)
-                if (dx == 0 and dy <= WorldModel.explosion_range) or (dx <= WorldModel.explosion_range and dy == 0) or (dx == dy == 0):
-                    features["inBombDanger"] = 1
-                else:
-                    features["inBombDanger"] = 0
-
-        # Mobility. Should always have the self_position, so if statement is probably redundant
-        if WorldModel.self_position:
-            forbidden_cells = immediate_lethal_positions(model)
-            forbidden = forbidden_cells or set()
-            visited = {WorldModel.self_position}
-            frontier = [(WorldModel.self_position, 0)]
-            while frontier:
-                current, steps = frontier.pop(0)
-                if steps < num_steps:
-                    for neighbor in model.neighbors(current):
-                        if neighbor in forbidden:
-                            continue
-                        if neighbor not in visited:
-                            visited.add(neighbor)
-                            frontier.append((neighbor, steps + 1))
-            features["mobility"] = len(visited) - 1  # exclude the starting position
-
-        # Loops for escaping monsters in future chambers [To be implemented when I can think clearly]
-        # WorldModel.walls
         
 
     

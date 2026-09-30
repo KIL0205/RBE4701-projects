@@ -65,6 +65,20 @@ FALLBACK = EvaluationProfile(
     wait_penalty=6.0,
 )
 
+QLEARNING = EvaluationProfile(
+    exit_progress_weight=1.0,
+    mobility_weight=1.0,
+    escape_options_weight=1.0,
+    monster_threat_weight=1.0,
+    bomb_threat_weight=1.0,
+    explosion_threat_weight=1.0,
+    trap_risk_weight=1.0,
+    future_monster_risk_weight=1.0,
+    future_escape_options_weight=1.0,
+    future_trap_risk_weight=1.0,
+    wait_penalty=1.0,
+)
+
 DEFAULT_PROFILES = {
     "normal": NORMAL_NAVIGATION,
     "emergency": EMERGENCY_ESCAPE,
