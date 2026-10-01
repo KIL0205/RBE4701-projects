@@ -18,7 +18,9 @@ from .safety import (
 )
 
 from Bomberman.entity import CharacterEntity
-
+from world_model import Position, WorldModel
+from evaluation import evaluate_position, QLEARNING
+import navigation
 
 class QAgent(CharacterEntity):
     # rewards
@@ -47,6 +49,26 @@ class QAgent(CharacterEntity):
         # TODO: Implement the action selection and execution logic for the agent's turn
         pass
 
+    def features(model: WorldModel) -> Dict[str, float | bool]:
+        features = evaluate_position(model, model.self_position, QLEARNING)
+        """
+        "exit_progress",
+        "mobility",
+        "escape_options",
+        "monster_threat",
+        "bomb_threat",
+        "explosion_threat",
+        "trap_risk",
+        "future_monster_risk",
+        "future_escape_options",
+        "future_trap_risk",
+        "lethal",
+        """
+        return features
+
+        
+
+    
     def get_q_value(self, features: Dict[str, float]) -> float:
 
         q_value = 0.0
