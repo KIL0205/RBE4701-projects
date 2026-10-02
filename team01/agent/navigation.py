@@ -56,6 +56,40 @@ def find_path(
                 came_from[neighbor] = current
     return []
 
+def find_exit_path(
+    model: WorldModel,
+    start: Position,
+    goal: Position,
+) -> Tuple[int, int] | None:
+    """Return (distance, walls crossed) for the fewest-wall exit route."""
+    if not model.in_bounds(start) or not model.in_bounds(goal):
+        return None
+
+    start_cost = (0, 0)
+    cost_so_far = {start: start_cost}
+    frontier = [(0, 0, start)]
+    while frontier:
+        walls_crossed, distance, current = heapq.heappop(frontier)
+        if cost_so_far.get(current) != (walls_crossed, distance):
+            continue
+        if current == goal:
+            return distance, walls_crossed
+
+        x, y = current
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                if dx == 0 and dy == 0:
+                    continue
+                neighbor = (x + dx, y + dy)
+                if not model.in_bounds(neighbor):
+                    continue
+                next_cost = (walls_crossed + int(model.is_wall(neighbor)), distance + 1)
+                if neighbor not in cost_so_far or next_cost < cost_so_far[neighbor]:
+                    cost_so_far[neighbor] = next_cost
+                    heapq.heappush(frontier, (*next_cost, neighbor))
+    return None
+
+
 def measure_mobility(
     model: WorldModel,
     position: Position,

@@ -1,10 +1,13 @@
 from dataclasses import dataclass
+import math
 from typing import Iterable, Mapping, Set
 
 from .actions import AgentAction
-from .navigation import find_path, measure_mobility
+from .navigation import find_exit_path, find_path, measure_mobility
 from .safety import monster_reachable_layers
 from .world_model import Position, WorldModel
+
+Q_FEATURE_VERSION = 1
 
 
 @dataclass(frozen=True)
@@ -175,6 +178,35 @@ def measure_exit_progress(model: WorldModel, position: Position) -> float:
     return float(old_distance - new_distance)
 
 
+def measure_exit_transition(
+    current_model: WorldModel,
+    predicted_model: WorldModel,
+) -> tuple[float, float]:
+    """Return spatial and wall progress from a current-to-predicted transition."""
+    if (
+        current_model.exit_position is None
+        or predicted_model.exit_position is None
+        or current_model.self_position is None
+        or predicted_model.self_position is None
+    ):
+        return 0.0, 0.0
+
+    before = find_exit_path(
+        current_model,
+        current_model.self_position,
+        current_model.exit_position,
+    )
+    after = find_exit_path(
+        predicted_model,
+        predicted_model.self_position,
+        predicted_model.exit_position,
+    )
+    if before is None or after is None:
+        return 0.0, 0.0
+
+    return float(before[0] - after[0]), float(before[1] - after[1])
+
+
 def measure_threat(model: WorldModel, position: Position) -> float:
     """Measure current monster, bomb, and explosion threat."""
     threat = 0.0
@@ -304,6 +336,63 @@ def evaluate_position(
         "future_trap_risk": future_trap_risk,
         "lethal": lethal,
     }
+
+
+def normalize_q_features(
+    features: dict[str, float | bool],
+    model: WorldModel,
+) -> dict[str, float]:
+    normalized = {name: float(value) for name, value in features.items()}
+    for name, value in normalized.items():
+        if not math.isfinite(value):
+            normalized[name] = 0.0
+
+    max_distance = max(1, model.width + model.height)
+    max_walls = max(1, model.width * model.height)
+    normalized["exit_progress"] = max(
+        -1.0,
+        min(1.0, normalized["exit_progress"] / max_distance),
+    )
+    normalized["exit_wall_progress"] = max(
+        -1.0,
+        min(1.0, normalized["exit_wall_progress"] / max_walls),
+    )
+    normalized["mobility"] = max(0.0, min(1.0, normalized["mobility"] / 24.0))
+    normalized["escape_options"] = max(0.0, min(1.0, normalized["escape_options"] / 8.0))
+    normalized["monster_threat"] = max(0.0, min(1.0, normalized["monster_threat"] / 100.0))
+    normalized["bomb_threat"] = max(0.0, min(1.0, normalized["bomb_threat"] / 100.0))
+    normalized["explosion_threat"] = max(0.0, min(1.0, normalized["explosion_threat"] / 100.0))
+    normalized["trap_risk"] = max(0.0, min(1.0, normalized["trap_risk"] / 100.0))
+    normalized["future_monster_risk"] = float(bool(normalized["future_monster_risk"]))
+    normalized["future_escape_options"] = max(
+        0.0,
+        min(1.0, normalized["future_escape_options"] / 8.0),
+    )
+    normalized["future_trap_risk"] = max(0.0, min(1.0, normalized["future_trap_risk"]))
+    normalized["lethal"] = float(bool(normalized["lethal"]))
+    return normalized
+
+
+def evaluate_q_features(
+    current_model: WorldModel,
+    predicted_model: WorldModel,
+) -> dict[str, float]:
+    """Central Project 2 feature definition, including Q-specific scaling."""
+    position = predicted_model.self_position or current_model.self_position or (0, 0)
+    features = evaluate_position(predicted_model, position, QLEARNING)
+    features["exit_progress"], features["exit_wall_progress"] = measure_exit_transition(
+        current_model,
+        predicted_model,
+    )
+    normalized = normalize_q_features(features, predicted_model)
+    normalized["bias"] = 1.0
+    return normalized
+
+
+def q_feature_names() -> tuple[str, ...]:
+    """Return feature names from the current Q feature definition."""
+    model = WorldModel(1, 1)
+    return tuple(evaluate_q_features(model, model))
 
 
 def evaluate_action(

@@ -236,6 +236,8 @@ def legal_candidate_actions(model) -> List[AgentAction]:
             if target in model.bombs:
                 continue
             actions.append(AgentAction(dx, dy, False))
+    if len(model.bombs) < 1:
+        actions.append(AgentAction(0, 0, True))  # place bomb in current position
     return actions
 
 
