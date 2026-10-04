@@ -38,3 +38,35 @@ In the fourth variant of this scenario, an aggressive monster is present:
 
 In the fifth variant of this scenario, two monsters are present: an aggressive
 one and a stupid one.
+
+## Project 2 training and evaluation
+
+### Train
+in project 2 run:
+```text
+python training.py --curriculum drills --workers 20 --guis 1 --trials 20 --survive 10 --eval-trials 20 --drill-refresh-after 100 --drill-refresh-trials 5
+```
+or 
+```text
+python training.py -h
+```
+which will show all of the command line configurables with discribtions
+
+Use `--guis 0` for headless training. Individual worker reports are off by
+default; add `--worker-details` when debugging. Drill maps are in
+`team01/project2/drills/`, and the default checkpoint is
+`team01/project2/q_learning_weights.json`. Training writes a diagnostic
+`training_history.jsonl`; this history is not needed to load weights or resume
+the curriculum.
+
+### Grade the saved policy
+
+in eval run 
+```text
+python project2_grading_eval.py --runs 50 --no-display
+```
+
+Use `--runs 2 --no-display` for a quick test. The evaluator loads the
+included `team01/project2/q_learning_weights.json` checkpoint by default and
+writes its report under `team01/eval/results/`, creating that directory when
+needed. To show game windows, omit `--no-display` and run.

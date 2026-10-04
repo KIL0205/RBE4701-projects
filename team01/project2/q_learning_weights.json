@@ -1,1 +1,39 @@
-{"feature_version": 1, "features": ["bias", "bomb_threat", "escape_options", "exit_progress", "exit_wall_progress", "explosion_threat", "future_escape_options", "future_monster_risk", "future_trap_risk", "lethal", "mobility", "monster_threat", "trap_risk"], "weights": {"bias": -46.67999468765758, "bomb_threat": 145.94343574212147, "escape_options": -117.12660806875049, "exit_progress": 59.50407587610177, "exit_wall_progress": 1.1038006432902625, "explosion_threat": -839.7959247777306, "future_escape_options": 18.358919256254566, "future_monster_risk": -43.71829637940569, "future_trap_risk": -188.97298954005308, "lethal": -157.43795586024734, "mobility": -21.390089718274012, "monster_threat": 80.81344434128769, "trap_risk": -101.22764152750543}}
+{
+  "feature_version": 3,
+  "features": [
+    "q_bias",
+    "win_next_update",
+    "loss_next_update",
+    "explosion_threat",
+    "open_route_progress_gain",
+    "breach_site_approach_gain",
+    "bomb_wall_route_gain",
+    "monster_in_clear_blast_ray",
+    "bomb_escape_margin",
+    "active_bomb_escape_margin",
+    "unproductive_bomb",
+    "safe_successor_fraction",
+    "escape_route_diversity",
+    "monster_clearance",
+    "monster_fuse_envelope_overlap",
+    "urgency_scaled_objective_progress"
+  ],
+  "weights": {
+    "q_bias": 5.184022381055278,
+    "win_next_update": 5.949423861292652,
+    "loss_next_update": -1.5107516841703585,
+    "explosion_threat": -0.5028119414179223,
+    "open_route_progress_gain": 0.7708920883406899,
+    "breach_site_approach_gain": 0.0825650288708471,
+    "bomb_wall_route_gain": -0.0019317255706248016,
+    "monster_in_clear_blast_ray": 0.0,
+    "bomb_escape_margin": -0.009701944640362413,
+    "active_bomb_escape_margin": -0.025121419259794317,
+    "unproductive_bomb": -4.950728826550162e-05,
+    "safe_successor_fraction": 3.4737221081639325,
+    "escape_route_diversity": -0.016649008395509306,
+    "monster_clearance": -1.099021102914668,
+    "monster_fuse_envelope_overlap": 0.0,
+    "urgency_scaled_objective_progress": 1.529884311245817
+  }
+}

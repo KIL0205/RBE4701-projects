@@ -56,6 +56,9 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+# Local Python environment
+.venv/
+
 # C extensions
 *.so
 
@@ -102,6 +105,12 @@ coverage.xml
 *.cover
 .hypothesis/
 .pytest_cache/
+
+# Project 2 runtime output
+/team01/project2/training_history.jsonl
+/team01/eval/results/
+/team01/eval/tuning_results*/
+/team01/eval/tuning_results*_console.log
 
 # Translations
 *.mo
@@ -182,4 +191,3 @@ $RECYCLE.BIN/
 *.lnk
 
 # End of https://www.gitignore.io/api/linux,macos,python,pycharm,windows
-

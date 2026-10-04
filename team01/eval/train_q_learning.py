@@ -45,8 +45,8 @@ def _verify_bias_feature_vectors(agent: QAgent) -> None:
     def checked_features(sensed_world, action):
         features = original_features(sensed_world, action)
         agent.feature_vector_count += 1
-        if features.get("bias") != 1.0:
-            raise RuntimeError("Q-learning feature vector bias must equal 1.0")
+        if features.get("q_bias") != 1.0:
+            raise RuntimeError("Q-learning feature vector q_bias must equal 1.0")
         agent.bias_activation_count += 1
         return features
 
@@ -410,7 +410,7 @@ def run_training(
     bias_percentage = 100.0 * bias_activations / feature_vectors if feature_vectors else 0.0
     print(
         f"Bias verification | activation={bias_activations}/{feature_vectors} "
-        f"({bias_percentage:.1f}%) learned_weight={weights.get('bias', 0.0):.6g}",
+        f"({bias_percentage:.1f}%) learned_weight={weights.get('q_bias', 0.0):.6g}",
         flush=True,
     )
 

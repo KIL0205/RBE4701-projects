@@ -1,13 +1,34 @@
 from dataclasses import dataclass
+from collections import deque
+import heapq
 import math
 from typing import Iterable, Mapping, Set
 
+from Bomberman.events import Event
 from .actions import AgentAction
 from .navigation import find_exit_path, find_path, measure_mobility
-from .safety import monster_reachable_layers
+from .safety import monster_reachable_cells, monster_reachable_layers
 from .world_model import Position, WorldModel
 
-Q_FEATURE_VERSION = 1
+Q_FEATURE_VERSION = 3
+Q_FEATURE_NAMES = (
+    "q_bias",
+    "win_next_update",
+    "loss_next_update",
+    "explosion_threat",
+    "open_route_progress_gain",
+    "breach_site_approach_gain",
+    "bomb_wall_route_gain",
+    "monster_in_clear_blast_ray",
+    "bomb_escape_margin",
+    "active_bomb_escape_margin",
+    "unproductive_bomb",
+    "safe_successor_fraction",
+    "escape_route_diversity",
+    "monster_clearance",
+    "monster_fuse_envelope_overlap",
+    "urgency_scaled_objective_progress",
+)
 
 
 @dataclass(frozen=True)
@@ -337,62 +358,602 @@ def evaluate_position(
         "lethal": lethal,
     }
 
+# Q feature normalization and bounds
+_Q_FEATURE_BOUNDS = {
+    "q_bias": (1.0, 1.0),
+    "win_next_update": (0.0, 1.0),
+    "loss_next_update": (0.0, 1.0),
+    "explosion_threat": (0.0, 1.0),
+    "open_route_progress_gain": (-1.0, 1.0),
+    "breach_site_approach_gain": (-1.0, 1.0),
+    "bomb_wall_route_gain": (0.0, 1.0),
+    "monster_in_clear_blast_ray": (0.0, 1.0),
+    "bomb_escape_margin": (-1.0, 1.0),
+    "active_bomb_escape_margin": (-1.0, 1.0),
+    "unproductive_bomb": (0.0, 1.0),
+    "safe_successor_fraction": (0.0, 1.0),
+    "escape_route_diversity": (0.0, 1.0),
+    "monster_clearance": (0.0, 1.0),
+    "monster_fuse_envelope_overlap": (0.0, 1.0),
+    "urgency_scaled_objective_progress": (-1.0, 1.0),
+}
 
+# Normalize Q features based on predefined bounds
 def normalize_q_features(
-    features: dict[str, float | bool],
-    model: WorldModel,
+    features: Mapping[str, float],
+    model: WorldModel | None = None,
 ) -> dict[str, float]:
-    normalized = {name: float(value) for name, value in features.items()}
-    for name, value in normalized.items():
-        if not math.isfinite(value):
-            normalized[name] = 0.0
+    """Validate and bound the active Q feature schema."""
+    del model
+    if set(features) != set(Q_FEATURE_NAMES):
+        missing = set(Q_FEATURE_NAMES) - set(features)
+        stale = set(features) - set(Q_FEATURE_NAMES)
+        raise ValueError(f"Q feature schema mismatch: missing={missing}, extra={stale}")
 
-    max_distance = max(1, model.width + model.height)
-    max_walls = max(1, model.width * model.height)
-    normalized["exit_progress"] = max(
-        -1.0,
-        min(1.0, normalized["exit_progress"] / max_distance),
+    normalized = {}
+    for name in Q_FEATURE_NAMES:
+        value = float(features[name])
+        if not math.isfinite(value):
+            raise ValueError(f"Q feature {name} is not finite: {value}")
+        lower, upper = _Q_FEATURE_BOUNDS[name]
+        normalized[name] = max(lower, min(upper, value))
+    return normalized
+
+# Compute move distances from a starting position, considering blocked positions.
+def _move_distances(
+    model: WorldModel,
+    start: Position,
+    blocked: Set[Position] | None = None,
+) -> dict[Position, int]:
+    forbidden = blocked or set()
+    distances = {start: 0}
+    frontier = deque([start])
+    while frontier:
+        current = frontier.popleft()
+        for neighbor in model.neighbors(current):
+            if neighbor in distances or neighbor in forbidden:
+                continue
+            distances[neighbor] = distances[current] + 1
+            frontier.append(neighbor)
+    return distances
+
+# Use A* search to find an optimal route considering removed walls and bombs.
+def _route_profile(
+    model: WorldModel,
+    removed_walls: Iterable[Position] = (),
+    removed_bombs: Iterable[Position] = (),
+) -> tuple[int, int, list[Position]] | None:
+    """Find a route minimizing destructible walls, then moves."""
+    start = model.self_position
+    goal = model.exit_position
+    if start is None or goal is None or not model.in_bounds(start) or not model.in_bounds(goal):
+        return None
+    cleared = set(removed_walls)
+    cleared_bombs = set(removed_bombs)
+    best = {start: (0, 0)}
+    previous: dict[Position, Position | None] = {start: None}
+    frontier = [(0, 0, start[0], start[1])]
+    while frontier:
+        walls_crossed, steps, x, y = heapq.heappop(frontier)
+        current = (x, y)
+        if best.get(current) != (walls_crossed, steps):
+            continue
+        if current == goal:
+            path = []
+            cursor: Position | None = current
+            while cursor is not None:
+                path.append(cursor)
+                cursor = previous[cursor]
+            path.reverse()
+            return walls_crossed, steps, path
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                if dx == 0 and dy == 0:
+                    continue
+                neighbor = (x + dx, y + dy)
+                if (
+                    not model.in_bounds(neighbor)
+                    or neighbor in model.bombs and neighbor not in cleared_bombs
+                ):
+                    continue
+                wall_cost = int(model.is_wall(neighbor) and neighbor not in cleared)
+                candidate = (walls_crossed + wall_cost, steps + 1)
+                if neighbor not in best or candidate < best[neighbor]:
+                    best[neighbor] = candidate
+                    previous[neighbor] = current
+                    heapq.heappush(frontier, (*candidate, neighbor[0], neighbor[1]))
+    return None
+
+# Compute a score for a given route profile, balancing walls crossed and steps taken.
+def _route_score(profile: tuple[int, int, list[Position]], model: WorldModel) -> float:
+    wall_count, steps, _ = profile
+    return wall_count + steps / max(2, model.width * model.height + 1)
+
+# Compute the gain in route efficiency after removing certain walls.
+def _route_gain(
+    model: WorldModel,
+    removed_walls: Iterable[Position],
+    before: tuple[int, int, list[Position]] | None = None,
+    removed_bombs: Iterable[Position] = (),
+) -> float:
+    route_before = before if before is not None else _route_profile(model)
+    if route_before is None:
+        return 0.0
+    route_after = _route_profile(model, removed_walls, removed_bombs)
+    if route_after is None:
+        return 0.0
+    denominator = max(1.0, route_before[0] + 1.0)
+    return max(0.0, min(1.0, (_route_score(route_before, model) - _route_score(route_after, model)) / denominator))
+
+# Compute the actual blast geometry from a given origin, considering walls and entities.
+def _blast_geometry(
+    model: WorldModel,
+    origin: Position,
+    *,
+    ignore_entities: bool = False,
+    ignored_character_names: Set[str] | None = None,
+) -> tuple[Set[Position], Set[Position]]:
+    """Return actual cardinal blast cells and the first destructible wall per ray."""
+    blast = {origin}
+    hit_walls: Set[Position] = set()
+    ignored = ignored_character_names or set()
+    characters = {position for name, position in model.characters.items() if name not in ignored}
+    for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+        for distance in range(1, max(0, model.explosion_range) + 1):
+            position = (origin[0] + dx * distance, origin[1] + dy * distance)
+            if not model.in_bounds(position):
+                break
+            if position == model.exit_position or position in model.bombs:
+                break
+            blast.add(position)
+            if model.is_wall(position):
+                hit_walls.add(position)
+                break
+            if not ignore_entities and (
+                position in model.monsters or position in characters
+            ):
+                break
+    return blast, hit_walls
+
+# Identify useful breach sites along the current route, considering explosion range and walls.
+def _useful_breach_sites(
+    model: WorldModel,
+    route_before: tuple[int, int, list[Position]] | None,
+) -> Set[Position]:
+    if route_before is None or route_before[0] == 0 or model.exit_position is None:
+        return set()
+    route_walls = {position for position in route_before[2] if model.is_wall(position)}
+    sites: Set[Position] = set()
+    for wall in route_walls:
+        for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            for distance in range(1, max(0, model.explosion_range) + 1):
+                site = (wall[0] - dx * distance, wall[1] - dy * distance)
+                if not model.in_bounds(site):
+                    continue
+                if model.is_wall(site) or site in model.bombs or site == model.exit_position:
+                    continue
+                _, hit_walls = _blast_geometry(model, site, ignore_entities=True)
+                route_hits = hit_walls & route_walls
+                if route_hits and _route_gain(
+                    model,
+                    route_hits,
+                    route_before,
+                    removed_bombs={site},
+                ) > 0.0:
+                    sites.add(site)
+    return sites
+
+
+@dataclass(frozen=True)
+class QFeatureContext:
+    current_world: object
+    current_model: WorldModel
+    route_before: tuple[int, int, list[Position]] | None
+    current_open_distance: int | None
+    breach_sites: frozenset[Position]
+    breach_site_distances: dict[Position, int]
+    time_limit: int
+
+# Prepare the context for Q-feature computation, precomputing route and breach site information.
+def prepare_q_feature_context(
+    current_world,
+    current_model: WorldModel,
+    time_limit: int,
+) -> QFeatureContext:
+    """Precompute state-only route data once for every candidate in this state."""
+    start = current_model.self_position
+    goal = current_model.exit_position
+    route_before = _route_profile(current_model) if start is not None and goal else None
+    current_distances = _move_distances(current_model, start) if start is not None else {}
+    current_open_distance = current_distances.get(goal) if goal is not None else None
+    sites = (
+        _useful_breach_sites(current_model, route_before)
+        if current_open_distance is None
+        else set()
     )
-    normalized["exit_wall_progress"] = max(
-        -1.0,
-        min(1.0, normalized["exit_wall_progress"] / max_walls),
+    breach_distances = (
+        _move_distances(current_model, start)
+        if start is not None and sites
+        else {}
     )
-    normalized["mobility"] = max(0.0, min(1.0, normalized["mobility"] / 24.0))
-    normalized["escape_options"] = max(0.0, min(1.0, normalized["escape_options"] / 8.0))
-    normalized["monster_threat"] = max(0.0, min(1.0, normalized["monster_threat"] / 100.0))
-    normalized["bomb_threat"] = max(0.0, min(1.0, normalized["bomb_threat"] / 100.0))
-    normalized["explosion_threat"] = max(0.0, min(1.0, normalized["explosion_threat"] / 100.0))
-    normalized["trap_risk"] = max(0.0, min(1.0, normalized["trap_risk"] / 100.0))
-    normalized["future_monster_risk"] = float(bool(normalized["future_monster_risk"]))
-    normalized["future_escape_options"] = max(
-        0.0,
-        min(1.0, normalized["future_escape_options"] / 8.0),
+    return QFeatureContext(
+        current_world=current_world,
+        current_model=current_model,
+        route_before=route_before,
+        current_open_distance=current_open_distance,
+        breach_sites=frozenset(sites),
+        breach_site_distances=breach_distances,
+        time_limit=max(1, int(time_limit)),
     )
-    normalized["future_trap_risk"] = max(0.0, min(1.0, normalized["future_trap_risk"]))
-    normalized["lethal"] = float(bool(normalized["lethal"]))
+
+
+# Compute the distance to the nearest site from the start position.
+def _nearest_site_distance(
+    model: WorldModel,
+    start: Position | None,
+    sites: Set[Position] | frozenset[Position],
+    distances: dict[Position, int] | None = None,
+) -> int | None:
+    if start is None or not sites:
+        return None
+    if distances is None:
+        distances = _move_distances(model, start)
+    return min((distances[site] for site in sites if site in distances), default=None)
+
+
+def _distance_to_safe_cell(
+    model: WorldModel,
+    start: Position | None,
+    danger: Set[Position],
+    blocked: Set[Position] | None = None,
+    max_steps: int | None = None,
+) -> int | None:
+    if start is None:
+        return None
+    forbidden = set(blocked or ())
+    forbidden.update(model.monsters)
+    forbidden.update(model.explosions)
+    forbidden.discard(start)
+    distances = _move_distances(model, start, forbidden)
+    safe = [
+        distance
+        for position, distance in distances.items()
+        if position not in danger and (max_steps is None or distance <= max_steps)
+    ]
+    return min(safe, default=None)
+
+
+def _bomb_escape_margin(
+    model: WorldModel,
+    origin: Position | None,
+    agent_name: str,
+) -> float:
+    if origin is None:
+        return -1.0
+    blast, _ = _blast_geometry(
+        model,
+        origin,
+        ignore_entities=True,
+        ignored_character_names={agent_name},
+    )
+    available = max(0, int(model.bomb_time))
+    blocked = set(model.walls) | set(model.bombs)
+    blocked.discard(origin)
+    required = _distance_to_safe_cell(model, origin, blast, blocked)
+    if required is None:
+        return -1.0
+    return max(-1.0, min(1.0, (available - required) / max(1, available)))
+
+
+def _active_bomb_escape_margin(
+    model: WorldModel,
+    excluded_bombs: Set[Position] | None = None,
+    reference_position: Position | None = None,
+) -> float:
+    position = model.self_position
+    if position is None or not model.bomb_timers:
+        return 0.0
+    excluded = excluded_bombs or set()
+    threats = []
+    for bomb, timer in model.bomb_timers.items():
+        if bomb in excluded:
+            continue
+        blast, _ = _blast_geometry(model, bomb, ignore_entities=True)
+        if position in blast or (reference_position is not None and reference_position in blast):
+            threats.append((bomb, max(0, int(timer)), blast))
+    if not threats:
+        return 0.0
+    margins = []
+    for bomb, available, blast in threats:
+        if position not in blast:
+            margins.append(1.0)
+            continue
+        simultaneous_hazards = set(model.explosions)
+        for other_bomb, other_timer in model.bomb_timers.items():
+            if other_bomb in excluded:
+                continue
+            if max(0, int(other_timer)) <= available:
+                other_blast, _ = _blast_geometry(model, other_bomb, ignore_entities=True)
+                simultaneous_hazards.update(other_blast)
+        required = _distance_to_safe_cell(
+            model,
+            position,
+            simultaneous_hazards,
+            set(model.walls) | set(model.bombs),
+        )
+        margin = -1.0 if required is None else (available - required) / max(1, available)
+        margins.append(max(-1.0, min(1.0, margin)))
+    return min(margins, default=0.0)
+
+
+def _escape_route_diversity(
+    model: WorldModel,
+    start: Position | None,
+    danger: Set[Position],
+    horizon: int,
+) -> float:
+    if start is None or horizon < 1:
+        return 0.0
+    blocked = set(model.walls) | set(model.bombs) | set(model.monsters) | set(model.explosions)
+    blocked.discard(start)
+    viable = 0
+    for dx in (-1, 0, 1):
+        for dy in (-1, 0, 1):
+            if dx == 0 and dy == 0:
+                continue
+            first = (start[0] + dx, start[1] + dy)
+            if not model.in_bounds(first) or first in blocked:
+                continue
+            remaining = horizon - 1
+            distances = _move_distances(model, first, blocked)
+            if any(
+                position not in danger and distance <= remaining
+                for position, distance in distances.items()
+            ):
+                viable += 1
+    return viable / 8.0
+
+
+def _monster_fuse_envelope_overlap(
+    model: WorldModel,
+    blast: Set[Position],
+    horizon: int,
+) -> float:
+    if not blast or not model.monsters:
+        return 0.0
+    overlaps = []
+    for monster in model.monsters:
+        reachable = monster_reachable_cells(model, monster, horizon)
+        overlaps.append(len(reachable & blast) / len(blast))
+    return max(overlaps, default=0.0)
+
+
+def _event_feature(events: Iterable, feature: str, agent_name: str) -> float:
+    for event in events:
+        if (
+            feature == "win"
+            and event.tpe == Event.CHARACTER_FOUND_EXIT
+            and event.character.name == agent_name
+        ):
+            return 1.0
+        if feature == "loss":
+            if (
+                event.tpe == Event.CHARACTER_KILLED_BY_MONSTER
+                and event.character.name == agent_name
+            ):
+                return 1.0
+            if (
+                event.tpe == Event.BOMB_HIT_CHARACTER
+                and event.other is not None
+                and event.other.name == agent_name
+            ):
+                return 1.0
+    return 0.0
+
+
+def normalize_q_features(features: Mapping[str, float]) -> dict[str, float]:
+    """Validate and bound the active Q feature schema."""
+    if set(features) != set(Q_FEATURE_NAMES):
+        missing = set(Q_FEATURE_NAMES) - set(features)
+        stale = set(features) - set(Q_FEATURE_NAMES)
+        raise ValueError(f"Q feature schema mismatch: missing={missing}, extra={stale}")
+    normalized = {}
+    for name in Q_FEATURE_NAMES:
+        value = float(features[name])
+        if not math.isfinite(value):
+            raise ValueError(f"Q feature {name} is not finite: {value}")
+        lower, upper = _Q_FEATURE_BOUNDS[name]
+        normalized[name] = max(lower, min(upper, value))
     return normalized
 
 
 def evaluate_q_features(
+    current_world,
+    predicted_world,
     current_model: WorldModel,
     predicted_model: WorldModel,
+    action: AgentAction,
+    agent_name: str = "me",
+    time_limit: int | None = None,
+    predicted_events: Iterable = (),
+    context: QFeatureContext | None = None,
 ) -> dict[str, float]:
-    """Central Project 2 feature definition, including Q-specific scaling."""
-    position = predicted_model.self_position or current_model.self_position or (0, 0)
-    features = evaluate_position(predicted_model, position, QLEARNING)
-    features["exit_progress"], features["exit_wall_progress"] = measure_exit_transition(
-        current_model,
-        predicted_model,
+    """Build the complete action-conditioned Project 2 Q feature vector."""
+    start = current_model.self_position
+    position = predicted_model.self_position
+    goal = current_model.exit_position
+    dimensions = max(1, max(current_model.width, current_model.height) - 1)
+    if context is None or context.current_world is not current_world:
+        context = prepare_q_feature_context(
+            current_world,
+            current_model,
+            int(time_limit if time_limit is not None else current_world.time),
+        )
+    route_before = context.route_before
+    current_open_distance = context.current_open_distance
+    predicted_open_distance = (
+        _move_distances(predicted_model, position).get(goal)
+        if position is not None and goal is not None
+        else None
     )
-    normalized = normalize_q_features(features, predicted_model)
-    normalized["bias"] = 1.0
-    return normalized
+
+    open_progress = 0.0
+    if current_open_distance is not None:
+        if predicted_open_distance is None:
+            open_progress = -1.0
+        else:
+            open_progress = (current_open_distance - predicted_open_distance) / dimensions
+
+    breach_progress = 0.0
+    if current_open_distance is None and not action.place_bomb:
+        sites = context.breach_sites
+        before_distance = _nearest_site_distance(
+            current_model,
+            start,
+            sites,
+            context.breach_site_distances,
+        )
+        after_distance = _nearest_site_distance(predicted_model, position, sites)
+        if before_distance is not None:
+            breach_progress = (
+                -1.0
+                if after_distance is None
+                else (before_distance - after_distance) / dimensions
+            )
+
+    bomb_wall_gain = 0.0
+    monster_in_ray = 0.0
+    bomb_escape_margin = 0.0
+    unproductive_bomb = 0.0
+    monster_fuse_overlap = 0.0
+    bomb_blast: Set[Position] = set()
+    if action.place_bomb and start is not None:
+        bomb_blast, hit_walls = _blast_geometry(
+            predicted_model,
+            start,
+            ignored_character_names={agent_name},
+        )
+        bomb_wall_gain = _route_gain(
+            predicted_model,
+            hit_walls,
+            removed_bombs={start},
+        )
+        monster_in_ray = float(any(monster in bomb_blast for monster in predicted_model.monsters))
+        bomb_escape_margin = _bomb_escape_margin(predicted_model, start, agent_name)
+        unproductive_bomb = float(bomb_wall_gain <= 1e-9 and monster_in_ray == 0.0)
+        monster_fuse_overlap = _monster_fuse_envelope_overlap(
+            predicted_model,
+            bomb_blast,
+            max(0, int(predicted_world.bomb_time)),
+        )
+
+    active_explosion_cells = set(predicted_model.explosions)
+    explosion_threat = float(
+        position is not None and position in active_explosion_cells
+    )
+
+    newly_placed_bombs = {start} if action.place_bomb and start is not None else set()
+    active_margin = _active_bomb_escape_margin(
+        predicted_model,
+        newly_placed_bombs,
+        reference_position=current_model.self_position,
+    )
+    active_bomb_positions = set(predicted_model.bomb_timers)
+    active_bomb_positions.difference_update(newly_placed_bombs)
+    active_danger: Set[Position] = set(active_explosion_cells)
+    for bomb in active_bomb_positions:
+        timer = predicted_model.bomb_timers[bomb]
+        if timer <= max(0, int(predicted_world.bomb_time)):
+            blast, _ = _blast_geometry(predicted_model, bomb, ignore_entities=True)
+            active_danger.update(blast)
+
+    safe_successors = 0.0
+    if position is not None:
+        successors = list(predicted_model.neighbors(position))
+        if position not in predicted_model.bombs:
+            successors.append(position)
+        imminent = set(active_explosion_cells)
+        imminent.update(monster_immediate_cells(predicted_model))
+        for bomb in active_bomb_positions:
+            if predicted_model.bomb_timers[bomb] <= 0:
+                blast, _ = _blast_geometry(predicted_model, bomb, ignore_entities=True)
+                imminent.update(blast)
+        safe_successors = (
+            sum(cell not in imminent for cell in successors) / len(successors)
+            if successors
+            else 0.0
+        )
+
+    escape_route_diversity = 0.0
+    if action.place_bomb:
+        escape_route_diversity = _escape_route_diversity(
+            predicted_model,
+            position,
+            active_danger | bomb_blast,
+            max(0, int(predicted_world.bomb_time)),
+        )
+    elif active_margin != 0.0:
+        threatened_timers = [
+            timer
+            for bomb, timer in predicted_model.bomb_timers.items()
+            if position is not None
+            and position in _blast_geometry(predicted_model, bomb, ignore_entities=True)[0]
+        ]
+        if threatened_timers:
+            escape_route_diversity = _escape_route_diversity(
+                predicted_model,
+                position,
+                active_danger,
+                max(0, min(threatened_timers)),
+            )
+
+    if position is None or not predicted_model.monsters:
+        monster_clearance = 1.0
+    else:
+        nearest = min(
+            max(abs(position[0] - monster[0]), abs(position[1] - monster[1]))
+            for monster in predicted_model.monsters
+        )
+        monster_clearance = nearest / max(1, max(predicted_model.width, predicted_model.height) - 1)
+
+    urgency = max(0.0, min(1.0, 1.0 - current_world.time / context.time_limit))
+    objective_progress = open_progress if current_open_distance is not None else breach_progress
+    if _event_feature(predicted_events, "win", agent_name):
+        objective_progress = 1.0
+
+    win_next_update = _event_feature(predicted_events, "win", agent_name)
+    loss_event = _event_feature(predicted_events, "loss", agent_name)
+    player_alive = any(
+        character.name == agent_name
+        for group in predicted_world.characters.values()
+        for character in group
+    )
+    loss_next_update = float(loss_event == 1.0 or (not player_alive and win_next_update == 0.0))
+
+    features = {
+        "q_bias": 1.0,
+        "win_next_update": win_next_update,
+        "loss_next_update": loss_next_update,
+        "explosion_threat": explosion_threat,
+        "open_route_progress_gain": open_progress,
+        "breach_site_approach_gain": breach_progress,
+        "bomb_wall_route_gain": bomb_wall_gain,
+        "monster_in_clear_blast_ray": monster_in_ray,
+        "bomb_escape_margin": bomb_escape_margin,
+        "active_bomb_escape_margin": active_margin,
+        "unproductive_bomb": unproductive_bomb,
+        "safe_successor_fraction": safe_successors,
+        "escape_route_diversity": escape_route_diversity,
+        "monster_clearance": monster_clearance,
+        "monster_fuse_envelope_overlap": monster_fuse_overlap,
+        "urgency_scaled_objective_progress": objective_progress * urgency,
+    }
+    return normalize_q_features(features)
 
 
 def q_feature_names() -> tuple[str, ...]:
     """Return feature names from the current Q feature definition."""
-    model = WorldModel(1, 1)
-    return tuple(evaluate_q_features(model, model))
+    return Q_FEATURE_NAMES
 
 
 def evaluate_action(

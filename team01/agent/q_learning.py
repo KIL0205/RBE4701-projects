@@ -9,7 +9,12 @@ from Bomberman.events import Event
 from Bomberman.sensed_world import SensedWorld
 
 from .actions import AgentAction
-from .evaluation import Q_FEATURE_VERSION, evaluate_q_features, q_feature_names
+from .evaluation import (
+    Q_FEATURE_VERSION,
+    evaluate_q_features,
+    prepare_q_feature_context,
+    q_feature_names,
+)
 from .safety import legal_candidate_actions, monster_threat_cells
 from .world_model import WorldModel
 
@@ -20,11 +25,11 @@ class QAgent(CharacterEntity):
     R_COST_OF_LIVING = -0.1
     R_NEAR_MONSTER = 0.0
     R_STEP = 0.0
-    R_KILL_MONSTER = 20.0
-    R_BREAK_WALL = 1.0
+    R_KILL_MONSTER = 0.0
+    R_BREAK_WALL = 0.0
     R_PLACE_BOMB = 0.0
 
-    def __init__(self, name, avatar, x, y, alpha: float = 0.1, gamma: float = 0.9, epsilon: float = 0.1):
+    def __init__(self, name, avatar, x, y, alpha: float = 0.0005, gamma: float = 0.9, epsilon: float = 0.05):
         super().__init__(name, avatar, x, y)
         
         self.alpha = alpha
@@ -44,6 +49,8 @@ class QAgent(CharacterEntity):
         self.debug = False
         self.q_contributions_diagnostic = False
         self.diagnostic_tick = 0
+        self.episode_time_limit = None
+        self._q_feature_context = None
         self.last_score = 0.0
         self.episode_reward = 0.0
         self.bombs_placed = 0
@@ -120,14 +127,36 @@ class QAgent(CharacterEntity):
             print(f"[Q] candidates=[{candidates}] selected={action}")
 
     def features(self, wrld: SensedWorld, action: AgentAction) -> Dict[str, float]:
-        current_model = WorldModel.from_sensed_world(wrld)
-        predicted_world, _ = self.predict_next_state(wrld, action)
+        if self.episode_time_limit is None:
+            self.episode_time_limit = max(1, int(wrld.time))
+        context = self._q_feature_context
+        if context is not None and context.current_world is wrld:
+            current_model = context.current_model
+        else:
+            current_model = WorldModel.from_sensed_world(wrld)
+            context = prepare_q_feature_context(
+                wrld,
+                current_model,
+                self.episode_time_limit,
+            )
+            self._q_feature_context = context
+        predicted_world, predicted_events = self.predict_next_state(wrld, action)
         predicted_model = WorldModel.from_sensed_world(predicted_world)
         if predicted_model.self_position is None:
             me = wrld.me(self)
             if me is not None:
                 predicted_model.self_position = (me.x + action.dx, me.y + action.dy)
-        return evaluate_q_features(current_model, predicted_model)
+        return evaluate_q_features(
+            wrld,
+            predicted_world,
+            current_model,
+            predicted_model,
+            action,
+            agent_name=self.name,
+            time_limit=self.episode_time_limit,
+            predicted_events=predicted_events,
+            context=context,
+        )
 
     def predict_next_state(self, wrld: SensedWorld, action: AgentAction) -> Tuple[SensedWorld, List]:
         predicted = SensedWorld.from_world(wrld)
@@ -475,9 +504,9 @@ class QAgent(CharacterEntity):
             )
 
     def save_weights(self, file_path: str):
-        feature_names = tuple(sorted(q_feature_names()))
+        feature_names = tuple(q_feature_names())
         self.sync_weights(dict.fromkeys(feature_names, 0.0))
-        with open(file_path, "w") as file:
+        with open(file_path, "w", encoding="utf-8") as file:
             json.dump(
                 {
                     "feature_version": Q_FEATURE_VERSION,
@@ -485,37 +514,51 @@ class QAgent(CharacterEntity):
                     "weights": {name: self.weights[name] for name in feature_names},
                 },
                 file,
+                indent=2,
             )
 
     def load_weights(self, file_path: str):
-        with open(file_path, "r") as file:
+        with open(file_path, "r", encoding="utf-8") as file:
             saved = json.load(file)
 
-        current_features = set(q_feature_names())
-        if isinstance(saved, dict) and isinstance(saved.get("weights"), dict):
-            saved_version = saved.get("feature_version")
-            if saved_version != Q_FEATURE_VERSION:
-                raise ValueError(
-                    f"Saved weights use feature version {saved_version}; current "
-                    f"implementation uses version {Q_FEATURE_VERSION}. "
-                    "Previous weights cannot be safely reused. Start with new weights "
-                    "or explicitly migrate them."
-                )
-            saved_weights = saved["weights"]
-            saved_features = set(saved.get("features", saved_weights))
-        else:
-            if not isinstance(saved, dict) or not all(
-                isinstance(value, (int, float)) for value in saved.values()
-            ):
-                raise ValueError("Unrecognized Q-learning weight file format")
-            saved_weights = saved
-            saved_features = set(saved)
-            warnings.warn(
-                "Loading unversioned weights by feature name; assuming their "
-                f"semantics match feature version {Q_FEATURE_VERSION}.",
-                UserWarning,
-                stacklevel=2,
+        if not isinstance(saved, dict):
+            raise ValueError("Q-learning weights must be a JSON object")
+
+        if "feature_version" not in saved:
+            raise ValueError(
+                "Unversioned Q-learning weights cannot be safely reused; "
+                "the required feature_version field is missing."
             )
+
+        required_fields = {"feature_version", "features", "weights"}
+        missing_fields = required_fields - saved.keys()
+        if missing_fields:
+            raise ValueError(
+                "Q-learning weights are missing required field(s): "
+                + ", ".join(sorted(missing_fields))
+            )
+
+        saved_version = saved["feature_version"]
+        if saved_version != Q_FEATURE_VERSION:
+            raise ValueError(
+                f"Saved weights use feature version {saved_version}; current "
+                f"implementation uses version {Q_FEATURE_VERSION}. "
+                "Previous weights cannot be safely reused. Start with new weights "
+                "or explicitly migrate them."
+            )
+
+        saved_features = saved["features"]
+        if not isinstance(saved_features, list) or not all(
+            isinstance(name, str) for name in saved_features
+        ):
+            raise ValueError("Q-learning 'features' must be a list of feature names")
+
+        saved_weights = saved["weights"]
+        if not isinstance(saved_weights, dict):
+            raise ValueError("Q-learning 'weights' must be a dictionary")
+
+        current_features = set(q_feature_names())
+        saved_features = set(saved_features)
 
         if not all(isinstance(value, (int, float)) for value in saved_weights.values()):
             raise ValueError("Q-learning weights must be numeric")
@@ -539,3 +582,11 @@ class QAgent(CharacterEntity):
             for name in current_features
         }
         self.current_feature_names = current_features
+
+    def set_learning(self, no_training: bool, *, epsilon: float = 0.1) -> None:
+        if no_training:
+            self.training = False
+            self.epsilon = 0.0
+        else:
+            self.training = True
+            self.epsilon = epsilon
