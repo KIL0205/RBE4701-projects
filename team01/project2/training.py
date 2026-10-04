@@ -222,7 +222,7 @@ def progression(map_path: Path = DEFAULT_MAP_PATH) -> tuple[Challenge, ...]:
     """Return the existing Project 2 variants in their documented order."""
     return (
         Challenge(1, "Variant 1: Alone in the world", map_path, ()),
-        Challenge(2, "Variant 2: Random monster", map_path, MonsterConfig("stupid", "stupid", "S", 3, 9),),
+        Challenge(2, "Variant 2: Random monster", map_path, (MonsterConfig("stupid", "stupid", "S", 3, 9),),),
         Challenge(3, "Variant 3: Self-preserving monster", map_path, (MonsterConfig("smart", "selfpreserving", "S", 3, 9, 1),),),
         Challenge(4, "Variant 4: Aggressive monster", map_path, (MonsterConfig("smart", "aggressive", "A", 3, 13, 2),),),
         Challenge(5, "Variant 5: Stupid and aggressive monsters", map_path, (
@@ -231,7 +231,6 @@ def progression(map_path: Path = DEFAULT_MAP_PATH) -> tuple[Challenge, ...]:
             ),
         ),
     )
-
 
 def drill_progression() -> tuple[Drill, ...]:
     return (
