@@ -1,0 +1,42 @@
+
+// Training reported V1 100%, V2 85%, V3 75%, V4 75%, and V5 70%. 
+// Project 2 grader with 100 trials shows V1 96, V2 92, V3 72, V4 76, V5 50.
+{
+  "feature_version": 3,
+  "features": [
+    "q_bias",
+    "win_next_update",
+    "loss_next_update",
+    "explosion_threat",
+    "open_route_progress_gain",
+    "breach_site_approach_gain",
+    "bomb_wall_route_gain",
+    "monster_in_clear_blast_ray",
+    "bomb_escape_margin",
+    "active_bomb_escape_margin",
+    "unproductive_bomb",
+    "safe_successor_fraction",
+    "escape_route_diversity",
+    "monster_clearance",
+    "monster_fuse_envelope_overlap",
+    "urgency_scaled_objective_progress"
+  ],
+  "weights": {
+    "q_bias": -291.4365382372636,
+    "win_next_update": 806.2552168712735,
+    "loss_next_update": -752.3027942201733,
+    "explosion_threat": -44.19956255847832,
+    "open_route_progress_gain": 466.3308492616308,
+    "breach_site_approach_gain": 2.0211243524135205,
+    "bomb_wall_route_gain": -4.873469255147944,
+    "monster_in_clear_blast_ray": -0.9472870862238294,
+    "bomb_escape_margin": 47.93547196620508,
+    "active_bomb_escape_margin": 37.03707790117077,
+    "unproductive_bomb": -20.473851272585325,
+    "safe_successor_fraction": 311.29328576590467,
+    "escape_route_diversity": 8.65023759186165,
+    "monster_clearance": -2.1753565531533767,
+    "monster_fuse_envelope_overlap": -9.793489846508008,
+    "urgency_scaled_objective_progress": 199.40291825877208
+  }
+}
