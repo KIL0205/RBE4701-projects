@@ -96,6 +96,20 @@ class WorldModel:
                     moves.append(next_pos)
         return moves
 
+    def wall_neighbors(self, current_position: Position) -> List[Position]:
+        """
+        Returns the NSEW neighboring cells occupied by walls of the given position in the world model.
+        :param current_position [(int, int)] The coordinate in the grid.
+        :return        [[(int,int)]] A list of neighboring cells.
+        """
+        x, y = current_position
+        walls = []
+        pos = [[x, y + 1], [x, y - 1], [x + 1, y], [x - 1, y]]
+        for next in pos:
+            if self.is_wall(next):
+                walls.append(next)
+        return walls
+
     def monster_positions(self) -> List[Position]:
         return list(self.monsters)
 
