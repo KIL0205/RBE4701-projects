@@ -300,7 +300,7 @@ def measure_future_escape_options(model: WorldModel, position: Position) -> int:
 def measure_future_trap_risk(model: WorldModel, position: Position) -> float:
     """Penalize positions with very few future-safe escape choices."""
     options = measure_future_escape_options(model, position)
-    loop_radius = measure_max_loop_radius(model, groups)
+    loop_radius = measure_max_loop_radius(model)
 
     size_multiplier = 1/(loop_radius + 1)
     retval = 0.1
@@ -311,39 +311,10 @@ def measure_future_trap_risk(model: WorldModel, position: Position) -> float:
     return retval * size_multiplier
 
 
-def get_wall_groups(model: WorldModel) -> list[list[Position]]:
-    """Returns groups of adjacent walls, should run once at start. 
-    Used to log all starting wall groups for loop detection"""
-    ret_wall_groups = [[]]
-    walls = model.walls
-    while walls:
-        start_wall = walls(0)
-        wall_group = []
-        group_queue = []
-        group_queue.insert(start_wall)
-        while group_queue:
-            group_queue_copy = group_queue
-            for w in group_queue_copy:
-                if w not in wall_group:
-                    wall_group.insert(w)
-                    if w in walls:
-                        walls.remove(wn)
-                wall_neighbors = model.wall_neighbors(w)
-                for wn in wall_neighbors:
-                    if wn not in wall_group:
-                        wall_group.insert(wn)
-                        group_queue.insert(wn)
-                        if wn in walls:
-                            walls.remove(wn)
-                group_queue.remove(w)    
-        ret_wall_groups.insert(wall_group)
-    return ret_wall_groups
-
-
-def measure_max_loop_radius(model: WorldModel, groups: list[list[Position]]) -> int:
+def measure_max_loop_radius(model: WorldModel) -> int:
     """Returns the radius of the largest loop in the map"""
     max_loop_len = 0
-    for group in groups:
+    for group in model.wallgroups:
         prev = True
         swaps = 0
         for wall in group:
