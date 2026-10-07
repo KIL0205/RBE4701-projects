@@ -171,6 +171,13 @@ class ActionNode(LeafNode):
     def tick(self) -> Status:
         raise NotImplementedError
 
+# TODO: what does this need? =============================================================================
+class QLearningActionNode(ActionNode):
+    """Q-Learning action node. Success if action succeeds, fail if action fails. Always runs from the start."""
+    
+    @abstractmethod
+    def tick(self) -> Status:
+        raise NotImplementedError
 
 class ConditionNode(LeafNode):
     """Success if condition is true, fail if condition is false. Always runs from the start."""

@@ -7,15 +7,19 @@ import json
 from Bomberman.entity import CharacterEntity
 from Bomberman.events import Event
 from Bomberman.sensed_world import SensedWorld
+from team01.agent.black_board import BlackBoard
+from team01.agent.blackboard_keys import BBKeys
+from team01.agent.controller import QLearningRootController
 
 from .actions import AgentAction
 from .evaluation import (
     Q_FEATURE_VERSION,
     evaluate_q_features,
     prepare_q_feature_context,
+    profiles_from_mapping,
     q_feature_names,
 )
-from .safety import legal_candidate_actions, monster_threat_cells
+from .safety import find_executable_exit_action, legal_candidate_actions, monster_threat_cells, assess_immediate_safety
 from .world_model import WorldModel
 
 class QAgent(CharacterEntity):
@@ -28,9 +32,21 @@ class QAgent(CharacterEntity):
     R_KILL_MONSTER = 0.0
     R_BREAK_WALL = 0.0
     R_PLACE_BOMB = 0.0
+    
+    # class QCandidate(action, features, ):
+    #     action: AgentAction
+    #     features: Dict[str, float]
+    #     eligible: bool
+    #     rejection_reason: str
 
     def __init__(self, name, avatar, x, y, alpha: float = 0.0005, gamma: float = 0.9, epsilon: float = 0.05):
         super().__init__(name, avatar, x, y)
+        
+        ## behavior tree
+        self.blackboard = BlackBoard()
+        self.evaluation_profiles = profiles_from_mapping(None) ## NOTE: originally on bomberman agent. needed?
+        self.root = QLearningRootController(self.blackboard, self.evaluation_profiles)
+        ## -------------
         
         self.alpha = alpha
         self.gamma = gamma
@@ -67,15 +83,56 @@ class QAgent(CharacterEntity):
 
     def do(self, wrld: SensedWorld):
         current_model = WorldModel.from_sensed_world(wrld)
-        actions = legal_candidate_actions(current_model)
+        
+        # NOTE:
+        # basic approach to q-learning:
+        #   Pick an initial state, s, at random
+        #   while not at goal state do:
+        #       pick an action a at random
+        #       get s' and r
+        #       update Q(s, a) using (r + gamma*max(a')[Q(s', a')])
+        #   end while
+        
+        # update with behavior tree:
+        #   - QAgent owns action selection & learning
+        #   - behavior tree decides the context and allowed actions for each state
+        
+        # The Q-learning loop is better thought of as: 
+        #   observe state (s), choose an action (a), observe reward (r) and next state (s'), 
+        #   then update (Q(s,a)) using the best allowed action in (s').
+        
+        #   the state isn’t picked randomly each turn; in your agent, the world observation supplies it.
+        
+        # Update action set selection using tree ==============
+        legal_actions = legal_candidate_actions(current_model)
+        
+        legal_actions_features = [self.features(wrld, action) for action in legal_actions]
+        
+        self.blackboard.erase() #sets all keys values to None
+
+        self.blackboard.set(BBKeys.WORLD_MODEL, current_model)
+        self.blackboard.set(BBKeys.SENSED_WORLD, wrld)
+        self.blackboard.set(BBKeys.POSSIBLE_ACTIONS, legal_actions)
+        self.blackboard.set(BBKeys.POSSIBLE_ACTIONS_FEATURES, legal_actions_features)
+        self.root.tick()
+        
+        candidate_actions = {
+            action
+            for action, features in self.blackboard.get(BBKeys.Q_CANDIDATES).items()
+            }
+        
+        candidates = self.blackboard.get(BBKeys.Q_CANDIDATES)
+        
+        # ==============
+        
         me = wrld.me(self)
         bomb_action = AgentAction(0, 0, True)
         can_place_bomb = me is not None and not any(
             bomb.owner == me for bomb in wrld.bombs.values()
         )
-        actions = [action for action in actions if not action.place_bomb or can_place_bomb]
-        if can_place_bomb and bomb_action not in actions:
-            actions.append(bomb_action)
+        actions = [action for action in candidate_actions if not action.place_bomb or can_place_bomb]
+        # if can_place_bomb and bomb_action not in actions: ## NOTE: no randomly adding bombs now
+        #     legal_actions.append(bomb_action)
 
         transition_debug = None
         if (
@@ -97,7 +154,7 @@ class QAgent(CharacterEntity):
         if action is None:
             return
 
-        features = self.features(wrld, action)
+        features = candidates[action]# self.features(wrld, action)
 
         self.prev_model = current_model
         self.prev_action = action
@@ -185,12 +242,14 @@ class QAgent(CharacterEntity):
 
 
     def choose_action(self, wrld: SensedWorld, actions: List[AgentAction]) -> AgentAction:
+        """Choose the best action based on Q-values."""       
         self.last_candidate_q_values = []
         if not actions:
             return None
 
+        # exploration - if random choice is less than epsilon, pick random action
         if self.training and random.random() < self.epsilon:
-            selected_action = random.choice(actions)
+            selected_action = random.choice(actions) # TODO: maybe update with curious exploration function?
             if self.q_contributions_diagnostic:
                 random_state = random.getstate()
                 try:
@@ -210,6 +269,7 @@ class QAgent(CharacterEntity):
                 )
             return selected_action
 
+        # exploitation - otherwise, pick best known action in current state
         best_q, scored_actions = self.max_q_value(wrld, actions)
         self.last_candidate_q_values = scored_actions
         finite_actions = [
@@ -354,12 +414,24 @@ class QAgent(CharacterEntity):
         update_state: bool,
         record_diagnostics: bool,
     ):
+        """Score each candidate action based on its Q-value."""
         if not actions:
             return 0.0, [], []
         scored_actions = []
         details = []
+        # records = [] # list of candidate records, each containing an action & corresponding features
         for action in actions:
             features = self.features(wrld, action)
+            
+            # # Create a record for the current action and its features
+            # action_record = {"action": action, "features": features}
+            # records.append(QCandidate(
+            #     action=action,
+            #     features=features,
+            #     eligible=True,
+            #     rejection_reason=""
+            # ))
+            
             if update_state:
                 q_value = self.get_q_value(features)
                 if self.q_contributions_diagnostic:
@@ -375,6 +447,10 @@ class QAgent(CharacterEntity):
                 else:
                     self.max_abs_q = max(self.max_abs_q, abs(q_value))
             scored_actions.append((action, q_value))
+        
+        # # post the record of each action's feature dict to the blackboard
+        # self.blackboard.set(BBKeys.Q_CANDIDATES, records)
+        
         best_q = max(q for _, q in scored_actions)
         return best_q, scored_actions, details
 
