@@ -15,7 +15,7 @@ class WorldModel:
     self_position: Optional[Position] = None
     walls: Set[Position] = field(default_factory=set)
     need_wall_groups: bool = True
-    wallgroups: list[list[Position]] = [[]]
+    wallgroups: list[list[Position]] = field(default_factory=list)
     bombs: Set[Position] = field(default_factory=set)
     bomb_timers: Dict[Position, int] = field(default_factory=dict)
     explosions: Set[Position] = field(default_factory=set)
@@ -102,7 +102,7 @@ class WorldModel:
                     moves.append(next_pos)
         return moves
 
-    def wall_neighbors(self, current_position: Position) -> List[Position]
+    def wall_neighbors(self, current_position: Position) -> List[Position]:
         """
         Returns the NSEW neighboring cells occupied by walls of the given position in the world model.
         :param current_position [(int, int)] The coordinate in the grid.
