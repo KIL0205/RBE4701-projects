@@ -321,11 +321,37 @@ def measure_future_escape_options(model: WorldModel, position: Position) -> int:
 def measure_future_trap_risk(model: WorldModel, position: Position) -> float:
     """Penalize positions with very few future-safe escape choices."""
     options = measure_future_escape_options(model, position)
+    loop_radius = measure_max_loop_radius(model)
+
+    size_multiplier = 1/(loop_radius + 1)
+    retval = 0.25
     if options == 0:
-        return 1.0
+        retval = 1.0
     if options == 1:
-        return 0.5
-    return 0.0
+        retval = 0.5
+    return retval * size_multiplier
+
+
+def measure_max_loop_radius(model: WorldModel) -> int:
+    """Returns the radius of the largest loop in the map"""
+    max_loop_len = 0
+    for group in model.wallgroups:
+        prev = True
+        swaps = 0
+        for wall in group:
+            still_wall = model.is_wall(wall)
+            if prev != still_wall:
+                swaps += 1
+                prev = still_wall
+            # This implementation only checks for the first loop in a group.
+            if swaps == 1:
+                loop_start = group.index(wall)
+            if swaps == 3:
+                loop_len = group.index(wall) - loop_start - 1
+                if loop_len > max_loop_len:
+                    max_loop_len = loop_len
+                break
+    return max_loop_len
 
 
 def evaluate_position(

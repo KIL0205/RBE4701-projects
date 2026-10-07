@@ -14,6 +14,8 @@ class WorldModel:
     exit_position: Optional[Position] = None
     self_position: Optional[Position] = None
     walls: Set[Position] = field(default_factory=set)
+    need_wall_groups: bool = True
+    wallgroups: list[list[Position]] = [[]]
     bombs: Set[Position] = field(default_factory=set)
     bomb_timers: Dict[Position, int] = field(default_factory=dict)
     explosions: Set[Position] = field(default_factory=set)
@@ -36,6 +38,10 @@ class WorldModel:
             for y in range(wrld.height()):
                 if wrld.wall_at(x, y):
                     model.walls.add((x, y))
+
+        if model.need_wall_groups:
+            model.wallgroups = model.get_wall_groups()
+            model.need_wall_groups = False
 
         if wrld.exitcell is not None:
             model.exit_position = wrld.exitcell
@@ -95,6 +101,48 @@ class WorldModel:
                 if self.is_traversable(next_pos):
                     moves.append(next_pos)
         return moves
+
+    def wall_neighbors(self, current_position: Position) -> List[Position]
+        """
+        Returns the NSEW neighboring cells occupied by walls of the given position in the world model.
+        :param current_position [(int, int)] The coordinate in the grid.
+        :return        [[int,int]] A list of neighboring cells.
+        """
+        x, y = current_position
+        walls = []
+        pos = [[x, y + 1], [x, y - 1], [x + 1, y], [x - 1, y]]
+        for n in pos:
+            if self.is_wall(n):
+                walls.append(n)
+        return walls
+
+    def get_wall_groups(self) -> list[list[Position]]:
+        """Returns groups of adjacent walls, should run once at start.
+        Used to log all starting wall groups for loop detection"""
+        ret_wall_groups = [[]]
+        walls = self.walls
+        while walls:
+            start_wall = walls(0)
+            wall_group = []
+            group_queue = []
+            group_queue.insert(start_wall)
+            while group_queue:
+                group_queue_copy = group_queue
+                for w in group_queue_copy:
+                    if w not in wall_group:
+                        wall_group.insert(w)
+                        if w in walls:
+                            walls.remove(w)
+                    wall_neighbors = self.wall_neighbors(w)
+                    for wn in wall_neighbors:
+                        if wn not in wall_group:
+                            wall_group.insert(wn)
+                            group_queue.insert(wn)
+                            if wn in walls:
+                                walls.remove(wn)
+                    group_queue.remove(w)
+            ret_wall_groups.insert(wall_group)
+        return ret_wall_groups
 
     def monster_positions(self) -> List[Position]:
         return list(self.monsters)
