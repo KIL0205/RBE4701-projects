@@ -339,6 +339,7 @@ def measure_max_loop_radius(model: WorldModel) -> int:
         prev = True
         swaps = 0
         for wall in group:
+            # TODO: May actually be unordered, not L -> R on screen order. Due to set notation. could be ordered by x coord afterwards.
             still_wall = model.is_wall(wall)
             if prev != still_wall:
                 swaps += 1

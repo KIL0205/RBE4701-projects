@@ -15,7 +15,7 @@ class WorldModel:
     self_position: Optional[Position] = None
     walls: Set[Position] = field(default_factory=set)
     need_wall_groups: bool = True
-    wallgroups: list[list[Position]] = field(default_factory=list)
+    wallgroups: Set[frozenset[Position]] = field(default_factory=set)
     bombs: Set[Position] = field(default_factory=set)
     bomb_timers: Dict[Position, int] = field(default_factory=dict)
     explosions: Set[Position] = field(default_factory=set)
@@ -110,38 +110,35 @@ class WorldModel:
         """
         x, y = current_position
         walls = []
-        pos = [[x, y + 1], [x, y - 1], [x + 1, y], [x - 1, y]]
+        pos = [(x, y + 1), (x, y - 1), (x + 1, y), (x - 1, y)]
         for n in pos:
             if self.is_wall(n):
                 walls.append(n)
         return walls
 
-    def get_wall_groups(self) -> list[list[Position]]:
+    def get_wall_groups(self) -> Set[frozenset[Position]]:
         """Returns groups of adjacent walls, should run once at start.
         Used to log all starting wall groups for loop detection"""
-        ret_wall_groups = [[]]
-        walls = self.walls
+        ret_wall_groups = set()
+        walls = set(self.walls)
         while walls:
-            start_wall = walls(0)
-            wall_group = []
-            group_queue = []
-            group_queue.insert(start_wall)
+            start_wall = walls.pop()
+            wall_group = {start_wall}
+            group_queue = [start_wall]
             while group_queue:
-                group_queue_copy = group_queue
-                for w in group_queue_copy:
-                    if w not in wall_group:
-                        wall_group.insert(w)
-                        if w in walls:
-                            walls.remove(w)
-                    wall_neighbors = self.wall_neighbors(w)
-                    for wn in wall_neighbors:
-                        if wn not in wall_group:
-                            wall_group.insert(wn)
-                            group_queue.insert(wn)
-                            if wn in walls:
-                                walls.remove(wn)
-                    group_queue.remove(w)
-            ret_wall_groups.insert(wall_group)
+                w = group_queue.pop(0)
+                if w not in wall_group:
+                    wall_group.add(w)
+                    if w in walls:
+                        walls.remove(w)
+                for wn in self.wall_neighbors(w):
+                    if wn not in wall_group:
+                        wall_group.add(wn)
+                        group_queue.append(wn)
+                        if wn in walls:
+                            walls.remove(wn)
+                    # group_queue.remove(w)
+            ret_wall_groups.add(frozenset(wall_group))
         return ret_wall_groups
 
     def monster_positions(self) -> List[Position]:
