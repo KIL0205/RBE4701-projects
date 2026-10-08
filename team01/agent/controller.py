@@ -131,6 +131,49 @@ class ChooseSafeMove(ActionNode):
         self.blackboard.set(BBKeys.SELECTED_ACTION, best.action)
         return Status.SUCCESS
 
+## QLEARNING VERSION ================================================================
+class Q_IsDangerSoon(ConditionNode):
+    """Detect an observable near-term hazard without multi-tick search."""
+    def __init__(self, blackboard):
+        super().__init__("is_danger_soon", blackboard)
+
+    def tick(self):
+        model = self.blackboard.get(BBKeys.WORLD_MODEL)
+        if model is None or model.self_position is None:
+            return Status.FAILURE
+
+        lethal = immediate_lethal_positions(model)
+        bomb_danger = set()
+        for position, timer in model.bomb_timers.items():
+            if timer <= 2:
+                bomb_danger.update(bomb_blast_cells(model, position))
+        danger = lethal | bomb_danger
+        legal = self.blackboard.get(BBKeys.POSSIBLE_ACTIONS)
+        current_result = assess_immediate_safety(model, AgentAction(0, 0, False))
+        has_eligible_action = False
+        for action in legal:
+            if assess_immediate_safety(model, action).eligible:
+                has_eligible_action = True
+                break
+        
+        in_danger = False
+        
+        for action in legal:
+            action_pos = (model.self_position[0] + action.dx, model.self_position[1] + action.dy)
+            if action_pos in danger:
+                in_danger = True
+                break
+
+        if in_danger or not current_result.eligible or not has_eligible_action:
+            self.blackboard.set(BBKeys.DEBUG_INFO, {
+                "active_behavior": "IsDangerSoon",
+                "danger_reason": "near_term_observable_hazard",
+            })
+            self.blackboard.set(BBKeys.DANGER_CELLS, danger)
+            return Status.SUCCESS
+        return Status.FAILURE
+
+
 class IsDangerSoon(ConditionNode):
     """Detect an observable near-term hazard without multi-tick search."""
     def __init__(self, blackboard):
@@ -189,8 +232,8 @@ class Q_AvoidThreatMoveSet(QLearningActionNode):
                     and legal[action].get("explosion_threat") != 1.0  # safe if action doesn't result in being in active explosion
                     and ((action.place_bomb and legal[action].get("bomb_escape_margin") >= 0) # safe if placed bomb and action has bomb escape margin
                         or not action.place_bomb and legal[action].get("active_bomb_escape_margin") >= 0) # safe if didn't place bomb and action has active bomb escape margin
-                    and legal[action].get("safe_successor_fraction") > 0.5 # 1 = all immediate neighbors are safe
-                    and legal[action].get("escape_route_diversity") > 0.5 # 1 = all immediate neighbors have viable route to safety
+                    and legal[action].get("safe_successor_fraction") > 0.25 # 1 = all immediate neighbors are safe
+                    and (not action.place_bomb or (action.place_bomb and legal[action].get("escape_route_diversity") >= 0.25)) # 1 = all immediate neighbors have viable route to safety
                     )
         
         avoid_threat_candidates = {
@@ -258,19 +301,17 @@ class Q_NavigateToExitMoveSet(QLearningActionNode):
                 
         move_to_exit_candidates = {}
         
-        def save_and_exit_progress(action) -> bool:
-            return (legal[action].get("loss_next_update") != 1.0  # safe if the action doesn't result in loss
-                    and legal[action].get("explosion_threat") != 1.0  # safe if action doesn't result in being in active explosion
-                    and ((action.place_bomb and legal[action].get("bomb_escape_margin") >= 0) # safe if placed bomb and action has bomb escape margin
-                        or not action.place_bomb and legal[action].get("active_bomb_escape_margin") >= 0) # safe if didn't place bomb and action has active bomb escape margin
-                    and (legal[action].get("open_route_progress_gain") > 0 or legal[action].get("breach_site_approach_gain") > 0)  # closer to exit (or to a useful wall-breach position)
-                    and legal[action].get("urgency_scaled_objective_progress") > 0 # objective progress towards goal (either due to win or closer to exit/potential breach)
-                    )
+        def safe_action(action) -> bool:
+                    return (legal[action].get("loss_next_update") != 1.0 # safe if the action doesn't result in loss
+                            and legal[action].get("explosion_threat") != 1.0 # safe if action doesn't result in being in active explosion
+                            and ((action.place_bomb and legal[action].get("bomb_escape_margin") >= 0) # safe if placed bomb and action has bomb escape margin
+                                or not action.place_bomb and legal[action].get("active_bomb_escape_margin") >= 0) # safe if didn't place bomb and action has active bomb escape margin
+                            )
         
         move_to_exit_candidates = {
             action: features
             for action, features in legal.items()
-            if save_and_exit_progress(action)
+            if safe_action(action)
         }
         
         if not move_to_exit_candidates: # if no safe applicable moves, return failure
@@ -440,10 +481,17 @@ class Q_FindSafeFallbackMoveSet(QLearningActionNode):
         legal = {action: features for action, features in zip(legal_actions, legal_features)}
         fallback_action_candidates = {}
         
-        fallback_action_candidates = { # just selects actions that don't immediately result in death
+        def safe_action(action) -> bool:
+            return (legal[action].get("loss_next_update") != 1.0 # safe if the action doesn't result in loss
+                    and legal[action].get("explosion_threat") != 1.0 # safe if action doesn't result in being in active explosion
+                    and ((action.place_bomb and legal[action].get("bomb_escape_margin") >= 0) # safe if placed bomb and action has bomb escape margin
+                        or not action.place_bomb and legal[action].get("active_bomb_escape_margin") >= 0) # safe if didn't place bomb and action has active bomb escape margin
+                    )
+        
+        fallback_action_candidates = {
             action: features
             for action, features in legal.items()
-            if legal[action].get("loss_next_update") != 1.0
+            if safe_action(action)
         }
         
         if not fallback_action_candidates:
@@ -541,7 +589,7 @@ class QLearningRootController:
         imediate_danger_branch.add_child(Q_ChooseSafeMoveSet(blackboard, profiles["emergency"]))
 
         future_danger_branch = SequenceNode("future_danger", blackboard)
-        future_danger_branch.add_child(IsDangerSoon(blackboard))
+        future_danger_branch.add_child(Q_IsDangerSoon(blackboard))
         future_danger_branch.add_child(Q_AvoidThreatMoveSet(blackboard, profiles["emergency"]))
 
         safety_selector.add_child(imediate_danger_branch)

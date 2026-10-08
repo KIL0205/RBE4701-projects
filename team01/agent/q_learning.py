@@ -28,7 +28,7 @@ class QAgent(CharacterEntity):
     R_LOSE = -1000.0
     R_COST_OF_LIVING = -0.1
     R_NEAR_MONSTER = 0.0
-    R_STEP = 0.0
+    R_STEP = 0.1
     R_KILL_MONSTER = 0.0
     R_BREAK_WALL = 0.0
     R_PLACE_BOMB = 0.0
