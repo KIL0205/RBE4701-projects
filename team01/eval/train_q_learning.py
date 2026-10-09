@@ -16,6 +16,7 @@ from team01.eval.run_trials import _PROJECT1, _map_game
 from Bomberman.events import Event
 from Bomberman.sensed_world import SensedWorld
 from team01.agent.q_learning import QAgent
+from team01.agent.dqn_network import Transition
 from team01.agent.evaluation import q_feature_names
 from team01.agent.world_model import WorldModel
 
@@ -35,6 +36,8 @@ class EpisodeResult:
     feature_activation_counts: dict[str, int]
     feature_vector_count: int = 0
     bias_activation_count: int = 0
+    transitions: tuple[Transition, ...] = ()
+    executed_actions: int = 0
 
 
 def _verify_bias_feature_vectors(agent: QAgent) -> None:
@@ -68,6 +71,9 @@ def run_episode(
     """Run one world to a terminal event or timeout."""
     ticks = 0
     evaluation_reward = 0.0
+    reset_episode = getattr(agent, "reset_episode", None)
+    if reset_episode is not None:
+        reset_episode()
     training = agent.training
     if getattr(agent, "q_contributions_diagnostic", False):
         agent.diagnostic_tick = 0
@@ -84,7 +90,10 @@ def run_episode(
             and ticks % heartbeat_interval == 0
         ):
             print(f"[{progress_label}] still running... tick={ticks}", flush=True)
-        if agent.non_finite_q_values or agent.non_finite_q_fallbacks:
+        if (
+            getattr(agent, "non_finite_q_values", 0)
+            or getattr(agent, "non_finite_q_fallbacks", 0)
+        ):
             outcome = "NON_FINITE"
             break
         event_types = {event.tpe for event in world.events}
@@ -111,7 +120,11 @@ def run_episode(
             outcome = "TIMEOUT"
             break
 
-        if not training and agent.prev_model is not None and agent.prev_action is not None:
+        if (
+            not training
+            and getattr(agent, "prev_model", None) is not None
+            and getattr(agent, "prev_action", None) is not None
+        ):
             current_model = WorldModel.from_sensed_world(SensedWorld.from_world(world))
             evaluation_reward += agent.calc_reward(
                 agent.prev_model,
@@ -128,24 +141,34 @@ def run_episode(
             evaluation_reward += agent.R_LOSE
         outcome = "LOST" if not world.characters else "TIMEOUT"
 
+    complete_rollout_episode = getattr(agent, "complete_rollout_episode", None)
+    if complete_rollout_episode is not None:
+        complete_rollout_episode(outcome)
+
     return EpisodeResult(
         episode=episode,
         outcome=outcome,
         ticks=ticks,
-        total_reward=agent.episode_reward if training else evaluation_reward,
+        total_reward=(
+            agent.episode_reward
+            if training or getattr(agent, "collect_experience", False)
+            else evaluation_reward
+        ),
         bombs_placed=agent.bombs_placed,
-        non_finite_q_fallbacks=agent.non_finite_q_fallbacks,
-        non_finite_q_values=agent.non_finite_q_values,
+        non_finite_q_fallbacks=getattr(agent, "non_finite_q_fallbacks", 0),
+        non_finite_q_values=getattr(agent, "non_finite_q_values", 0),
         mean_abs_td_error=(
             agent.total_abs_td_error / agent.td_update_count
-            if agent.td_update_count
+            if getattr(agent, "td_update_count", 0)
             else 0.0
         ),
-        td_update_count=agent.td_update_count,
+        td_update_count=getattr(agent, "td_update_count", 0),
         max_abs_q=agent.max_abs_q,
-        feature_activation_counts=dict(agent.feature_activation_counts),
+        feature_activation_counts=dict(getattr(agent, "feature_activation_counts", {})),
         feature_vector_count=getattr(agent, "feature_vector_count", 0),
         bias_activation_count=getattr(agent, "bias_activation_count", 0),
+        transitions=tuple(getattr(agent, "episode_transitions", ())),
+        executed_actions=getattr(agent, "episode_action_count", 0),
     )
 
 

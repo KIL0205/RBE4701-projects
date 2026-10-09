@@ -127,36 +127,8 @@ class QAgent(CharacterEntity):
             print(f"[Q] candidates=[{candidates}] selected={action}")
 
     def features(self, wrld: SensedWorld, action: AgentAction) -> Dict[str, float]:
-        if self.episode_time_limit is None:
-            self.episode_time_limit = max(1, int(wrld.time))
-        context = self._q_feature_context
-        if context is not None and context.current_world is wrld:
-            current_model = context.current_model
-        else:
-            current_model = WorldModel.from_sensed_world(wrld)
-            context = prepare_q_feature_context(
-                wrld,
-                current_model,
-                self.episode_time_limit,
-            )
-            self._q_feature_context = context
-        predicted_world, predicted_events = self.predict_next_state(wrld, action)
-        predicted_model = WorldModel.from_sensed_world(predicted_world)
-        if predicted_model.self_position is None:
-            me = wrld.me(self)
-            if me is not None:
-                predicted_model.self_position = (me.x + action.dx, me.y + action.dy)
-        return evaluate_q_features(
-            wrld,
-            predicted_world,
-            current_model,
-            predicted_model,
-            action,
-            agent_name=self.name,
-            time_limit=self.episode_time_limit,
-            predicted_events=predicted_events,
-            context=context,
-        )
+        feature_values = q_feature_vector(self, wrld, action)
+        return dict(zip(q_feature_names(), feature_values))
 
     def predict_next_state(self, wrld: SensedWorld, action: AgentAction) -> Tuple[SensedWorld, List]:
         predicted = SensedWorld.from_world(wrld)
@@ -590,3 +562,44 @@ class QAgent(CharacterEntity):
         else:
             self.training = True
             self.epsilon = epsilon
+
+
+def q_feature_vector(
+    agent: QAgent,
+    wrld: SensedWorld,
+    action: AgentAction,
+) -> tuple[float, ...]:
+    """Return existing state-action features in the canonical schema order."""
+    if agent.episode_time_limit is None:
+        agent.episode_time_limit = max(1, int(wrld.time))
+    context = agent._q_feature_context
+    if context is not None and context.current_world is wrld:
+        current_model = context.current_model
+    else:
+        current_model = WorldModel.from_sensed_world(wrld)
+        context = prepare_q_feature_context(
+            wrld,
+            current_model,
+            agent.episode_time_limit,
+        )
+        agent._q_feature_context = context
+
+    predicted_world, predicted_events = agent.predict_next_state(wrld, action)
+    predicted_model = WorldModel.from_sensed_world(predicted_world)
+    if predicted_model.self_position is None:
+        me = wrld.me(agent)
+        if me is not None:
+            predicted_model.self_position = (me.x + action.dx, me.y + action.dy)
+
+    feature_values = evaluate_q_features(
+        wrld,
+        predicted_world,
+        current_model,
+        predicted_model,
+        action,
+        agent_name=agent.name,
+        time_limit=agent.episode_time_limit,
+        predicted_events=predicted_events,
+        context=context,
+    )
+    return tuple(feature_values[name] for name in q_feature_names())

@@ -1,72 +1,89 @@
-# Your goal #
+# Project 2: DQN training and grading
+Used AI to Generate this README 
 
-In this scenario, you must plan the route of your agent from the top-left
-corner to the exit. However, your route is obstructed - you need to use the bomb
-to create a path to the exit.
+## Architecture
 
-## Variant 1: Alone in the world ##
+The DQN scores each legal action from an action-conditioned vector of 17
+features: QAgent's 16 shared features plus `direct_objective_progress`. A
+128-128 ReLU policy network estimates Q(s, a); a separate frozen target network
+provides bootstrap values. Parallel CPU workers receive immutable policy
+snapshots and return transitions. The parent is the canonical learner: it owns
+replay, Adam updates, target synchronization, curriculum decisions, and
+checkpoint writes.
 
-In the first variant of this scenario, the world is deterministic and your agent
-is alone in the environment.
+## Setup
 
-## Variant 2: Random monster ##
+From the repository root, install runtime and development dependencies:
 
-In the second variant of this scenario, a stupid monster is present. The monster
-chooses its next cell uniformly at random among the possible reachable cells.
+Windows:
 
-## Variant 3: Self-preserving monster ##
-
-In the third variant of this scenario, a smarter monster is present:
-- The monster goes straight until it has reached an obstacle
-- When it reaches an obstacle, it changes direction at random among the cells
-  that are walkable and are not an explosion (if an agent, monster or character,
-  touches an explosion, it dies)
-- If the 8-distance of your agent to the monster is 1, the monster attacks your
-  agent immediately and kills it
-
-## Variant 4: Aggressive monster ##
-
-In the fourth variant of this scenario, an aggressive monster is present:
-- The monster goes straight until it has reached an obstacle
-- When it reaches an obstacle, it changes direction at random among the cells
-  that are walkable and are not an explosion (if an agent, monster or character,
-  touches an explosion, it dies)
-- If the 8-distance of your agent to the monster is 2, the monster moves towards
-  your agent and attempts to kill it
-
-## Variant 5: Stupid and Aggressive monsters together ##
-
-In the fifth variant of this scenario, two monsters are present: an aggressive
-one and a stupid one.
-
-## Project 2 training and evaluation
-
-### Train
-in project 2 run:
-```text
-python training.py --curriculum drills --workers 20 --guis 1 --trials 20 --survive 10 --eval-trials 20 --drill-refresh-after 100 --drill-refresh-trials 5
-```
-or 
-```text
-python training.py -h
-```
-which will show all of the command line configurables with discribtions
-
-Use `--guis 0` for headless training. Individual worker reports are off by
-default; add `--worker-details` when debugging. Drill maps are in
-`team01/project2/drills/`, and the default checkpoint is
-`team01/project2/q_learning_weights.json`. Training writes a diagnostic
-`training_history.jsonl`; this history is not needed to load weights or resume
-the curriculum.
-
-### Grade the saved policy
-
-in eval run 
-```text
-python project2_grading_eval.py --runs 50 --no-display
+```powershell
+py -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements-dev.txt
 ```
 
-Use `--runs 2 --no-display` for a quick test. The evaluator loads the
-included `team01/project2/q_learning_weights.json` checkpoint by default and
-writes its report under `team01/eval/results/`, creating that directory when
-needed. To show game windows, omit `--no-display` and run.
+The runtime dependencies are `pygame`, `colorama`, and PyTorch;
+
+## Train
+
+```powershell
+python -m team01.project2.training --agent dqn --curriculum drills --workers 10 --trials 20 --survive 15 --eval-trials 20 --weights team01/project2/dqn_checkpoint.pt --guis 0
+```
+
+The DQN checkpoint defaults to `team01/project2/dqn_checkpoint.pt`. If it
+exists, omitting `--fresh` loads its policy, target network, Adam state, and
+counters; replay starts empty and refills before updates resume. `--fresh`
+starts new networks and does not overwrite an existing checkpoint until a
+valid batch completes. `--trials` sets episodes per training batch; `--workers`
+sets maximum concurrent rollouts. The curriculum's `survive / trials`
+threshold is scaled to the newest variant's share of each mixed batch, so
+`--survive 15 --trials 20` sets a 75% stage threshold. This batch progression
+is distinct from final frozen evaluation, which requires at least 90% wins on
+every variant. Stagnation can trigger drill refreshes, but drills do not unlock
+variants.
+
+## Resume at a variant
+
+```powershell
+python -m team01.project2.training --agent dqn --start-variant 4 --workers 10 --trials 20 --survive 15 --weights team01/project2/dqn_checkpoint.pt
+```
+
+`--start-variant 4` makes V1-V4 available and makes V4 the current newest
+training stage. V4 has **not** passed its stage threshold, and V5 remains
+locked. The checkpoint stores learner state, not curriculum position; use
+`--start-variant` to select the variant stage when resuming.
+
+## DQN overrides
+
+Use `--dqn-learning-rate` and `--dqn-epsilon` to override the run's learning
+rate and exploration rate. The learning-rate override is applied after loading
+the checkpoint because Adam restores its saved parameter-group settings; it
+changes the rate without resetting learned network parameters or Adam moments.
+
+```powershell
+python -m team01.project2.training --agent dqn --dqn-learning-rate 0.00005 --dqn-epsilon 0.05
+```
+
+## Parallel grader
+
+```powershell
+python -m team01.eval.project2_grading_eval --agent dqn --weights team01/project2/dqn_checkpoint.pt --runs 20 --workers 10 --no-display
+```
+
+`--runs` is the number of episodes **per variant** (100 total for five
+variants); `--workers` limits concurrent worker processes and does not change
+the episode count. The parent assigns each episode a unique seed before
+dispatch, and results are restored to that planned order before scoring.
+Workers evaluate frozen policy copies and never train or save checkpoints.
+Use `--agent q` to grade the linear QAgent with
+`team01/project2/q_learning_weights.json`.
+
+## Checkpoints and tests
+
+DQN checkpoints atomically save policy and target parameters, Adam state,
+training counters, and feature-schema metadata. Replay is intentionally not
+saved. Checkpoints, `runs/`, training logs, and history files are generated
+local state and normally should not be committed.
+01/tests/test_project2_grading_parallel.py
+```

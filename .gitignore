@@ -111,6 +111,10 @@ coverage.xml
 /team01/eval/results/
 /team01/eval/tuning_results*/
 /team01/eval/tuning_results*_console.log
+/runs/
+/team01/project2/runs/
+/team01/eval/fullscale/runs/
+*.tmp
 
 # Translations
 *.mo

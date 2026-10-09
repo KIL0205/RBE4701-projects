@@ -1,10 +1,10 @@
-"""Progressively train the Project 2 approximate Q-learning agent."""
+"""Progressively train Project 2 Q-learning or DQN agents."""
 
 from __future__ import annotations
 
 import argparse
 from collections import deque
-from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, as_completed, wait
 from contextlib import redirect_stderr, redirect_stdout
 from functools import partial
 import io
@@ -14,7 +14,7 @@ import os
 import random
 import sys
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -32,11 +32,13 @@ if str(_BOMBERMAN_DIR) not in sys.path:
 DEFAULT_MAP_PATH = Path(__file__).resolve().with_name("map.txt")
 DRILL_MAP_DIRECTORY = Path(__file__).resolve().with_name("drills")
 DEFAULT_WEIGHTS_PATH = Path(__file__).resolve().with_name("q_learning_weights.json")
+DEFAULT_DQN_CHECKPOINT_PATH = Path(__file__).resolve().with_name("dqn_checkpoint.pt")
 DEFAULT_HISTORY_PATH = Path(__file__).resolve().with_name("training_history.jsonl")
 DEFAULT_TRIALS = 10
 DEFAULT_SURVIVE = 5
 DEFAULT_EVAL_TRIALS = 10
-FINAL_WIN_RATE_THRESHOLD = 0.75
+DQN_UPDATES_PER_BATCH = 100
+FINAL_WIN_RATE_THRESHOLD = 0.90
 STALE_WINDOW = 10
 STALE_RELATIVE_DELTA_THRESHOLD = 1e-5
 STALE_MEAN_TD_THRESHOLD = 0.05
@@ -99,6 +101,7 @@ class TrainingSummary:
     stopped_reason: Optional[str] = None
     weights_saved: bool = False
     current_round: int = 0
+    decision_trace: list = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -122,7 +125,7 @@ class TrainingOptions:
     trials: int
     survive: int
     seed: int
-    weights_path: Path
+    weights_path: Optional[Path]
     display: bool
     fresh: bool
     max_batches: Optional[int]
@@ -144,11 +147,16 @@ class TrainingOptions:
     agent_factory: Optional[Callable]
     game_factory: Optional[Callable]
     episode_runner: Optional[Callable]
+    agent_type: str = "q"
+    dqn_updates_per_batch: int = DQN_UPDATES_PER_BATCH
+    start_variant: Optional[int] = None
+    dqn_learning_rate: Optional[float] = None
+    dqn_epsilon: Optional[float] = None
 
 
 @dataclass(frozen=True)
 class TrainingBatchPlan:
-    """Episode assignments and progression threshold for one batch."""
+    """Episode assignments and scaled unlock threshold for one batch."""
 
     episode_items: tuple[int, ...]
     distribution: dict[int, int]
@@ -213,6 +221,51 @@ class ParallelTrainingResult:
     diagnostic_output: str = ""
     error: Optional[str] = None
     phase: str = "variant"
+
+
+@dataclass(frozen=True)
+class DQNRolloutTask:
+    """Pickle-safe episode input carrying one frozen CPU policy snapshot."""
+
+    worker_id: int
+    trial_index: int
+    trial_number: int
+    batch_number: int
+    seed: int
+    challenge: Challenge | Drill
+    policy_state_dict: dict[str, object]
+    feature_version: int
+    feature_names: tuple[str, ...]
+    epsilon: float
+    displayed: bool
+    worker_details: bool = False
+    time_limit: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class DQNRolloutResult:
+    """One rollout's outcome and transitions for the parent learner."""
+
+    worker_id: int
+    trial_index: int
+    trial_number: int
+    batch_number: int
+    seed: int
+    challenge_number: int
+    outcome: str
+    transitions: tuple[object, ...] = ()
+    ticks: int = 0
+    total_reward: float = 0.0
+    bombs_placed: int = 0
+    executed_actions: int = 0
+    max_abs_q: float = 0.0
+    non_finite_q_values: int = 0
+    non_finite_q_fallbacks: int = 0
+    optimizer_steps: int = 0
+    target_sync_count: int = 0
+    policy_unchanged: bool = True
+    gradients_absent: bool = True
+    error: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -362,6 +415,12 @@ def _create_qagent(**learning_parameters):
     return _qagent_class()("me", "C", 0, 0, **learning_parameters)
 
 
+def _create_dqn_agent():
+    from team01.agent.deep_q_learning import DeepQAgent
+
+    return DeepQAgent("me", "C", 0, 0)
+
+
 def _default_learning_parameters() -> tuple[float, float, float]:
     agent = _create_qagent()
     return agent.alpha, agent.gamma, agent.epsilon
@@ -377,7 +436,7 @@ def _weights_are_finite(weights: dict[str, float]) -> bool:
 def _build_variant_game(
     challenge: Challenge | Drill,
     seed: int,
-    weights: dict[str, float],
+    weights: Optional[dict[str, float]],
     agent_factory: Callable,
 ):
     from Bomberman.monsters.selfpreserving_monster import SelfPreservingMonster
@@ -405,13 +464,268 @@ def _build_variant_game(
             raise ValueError(f"Unknown Project 2 monster type: {monster.kind}")
 
     agent = agent_factory()
-    agent.weights = weights
+    if weights is not None:
+        agent.weights = weights
     game.add_character(agent)
     if not any(
         agent in characters for characters in game.world.characters.values()
     ):
         raise RuntimeError("training agent was not registered in its world")
     return game, agent
+
+
+def _dqn_policy_snapshot(agent) -> dict[str, object]:
+    """Copy only the policy parameters needed by inference-only workers."""
+    return {
+        name: tensor.detach().to(device="cpu").clone()
+        for name, tensor in agent.policy_network.state_dict().items()
+    }
+
+
+def _make_dqn_rollout_tasks(
+    agent,
+    assignments: tuple[tuple[Challenge | Drill, int], ...],
+    workers: int,
+    guis: int,
+    batch_number: int,
+    epsilon: float,
+    worker_details: bool = False,
+    time_limit: Optional[int] = None,
+) -> tuple[DQNRolloutTask, ...]:
+    """Plan episodes that all use the same immutable policy snapshot."""
+    from team01.agent.dqn_features import DQN_FEATURE_VERSION, dqn_feature_names
+
+    # CPU tensor copies keep CUDA state and the live parent agent out of worker payloads.
+    policy_snapshot = _dqn_policy_snapshot(agent)
+    return tuple(
+        DQNRolloutTask(
+            worker_id=(index - 1) % workers + 1,
+            trial_index=index,
+            trial_number=index,
+            batch_number=batch_number,
+            seed=seed,
+            challenge=challenge,
+            policy_state_dict=policy_snapshot,
+            feature_version=DQN_FEATURE_VERSION,
+            feature_names=dqn_feature_names(),
+            epsilon=epsilon,
+            displayed=((index - 1) % min(workers, len(assignments))) < guis,
+            worker_details=worker_details,
+            time_limit=time_limit,
+        )
+        for index, (challenge, seed) in enumerate(assignments, start=1)
+    )
+
+
+def _dqn_rollout_worker(task: DQNRolloutTask) -> DQNRolloutResult:
+    """Run one frozen-policy episode and return experience, never train or save.
+
+    Kept at module scope with a pickle-safe task/result so Windows spawn can
+    import the worker in a fresh process.
+    """
+    import torch
+
+    diagnostic_buffer = io.StringIO()
+    torch.set_num_threads(1)
+    agent = None
+    outcome = "WORKER_ERROR"
+    error_message = None
+    episode_result = None
+    try:
+        with redirect_stdout(diagnostic_buffer), redirect_stderr(diagnostic_buffer):
+            _configure_runtime(task.displayed)
+            from team01.agent.deep_q_learning import DeepQAgent
+            from team01.agent.dqn_features import (
+                DQN_FEATURE_VERSION,
+                dqn_feature_names,
+            )
+
+            if (
+                task.feature_version != DQN_FEATURE_VERSION
+                or task.feature_names != dqn_feature_names()
+            ):
+                raise ValueError("DQN rollout task uses a different feature schema")
+
+            agent = DeepQAgent(
+                "me",
+                "C",
+                0,
+                0,
+                epsilon=task.epsilon,
+                device="cpu",
+            )
+            agent.policy_network.load_state_dict(task.policy_state_dict, strict=True)
+            agent.set_rollout(epsilon=task.epsilon, collect_experience=True)
+            policy_before = _dqn_policy_snapshot(agent)
+            game, agent = _build_variant_game(
+                task.challenge,
+                task.seed,
+                None,
+                lambda: agent,
+            )
+            if task.time_limit is not None:
+                game.world.time = task.time_limit
+            label = (
+                f"Worker {task.worker_id} | Trial {task.trial_index} "
+                f"(batch {task.batch_number}) | {task.challenge.number} | "
+                f"Seed {task.seed}"
+            )
+            episode_result = _run_episode(
+                game,
+                agent,
+                task.trial_index,
+                label,
+                task.displayed,
+                worker_details=False,
+            )
+            policy_after = _dqn_policy_snapshot(agent)
+            policy_unchanged = all(
+                torch.equal(policy_before[name], policy_after[name])
+                for name in policy_before
+            )
+            gradients_absent = all(
+                parameter.grad is None
+                for parameter in agent.policy_network.parameters()
+            )
+            if not policy_unchanged or not gradients_absent:
+                raise RuntimeError(
+                    "rollout changed policy parameters or accumulated gradients"
+                )
+            return DQNRolloutResult(
+                worker_id=task.worker_id,
+                trial_index=task.trial_index,
+                trial_number=task.trial_number,
+                batch_number=task.batch_number,
+                seed=task.seed,
+                challenge_number=task.challenge.number,
+                outcome=episode_result.outcome,
+                transitions=tuple(episode_result.transitions),
+                ticks=episode_result.ticks,
+                total_reward=episode_result.total_reward,
+                bombs_placed=episode_result.bombs_placed,
+                executed_actions=episode_result.executed_actions,
+                max_abs_q=episode_result.max_abs_q,
+                non_finite_q_values=episode_result.non_finite_q_values,
+                non_finite_q_fallbacks=episode_result.non_finite_q_fallbacks,
+                optimizer_steps=agent.optimizer_steps,
+                target_sync_count=agent.target_sync_count,
+                policy_unchanged=policy_unchanged,
+                gradients_absent=gradients_absent,
+            )
+    except TrainingAborted as error:
+        outcome = "TRAINING_ABORTED"
+        error_message = str(error)
+    except Exception as error:
+        error_message = f"{type(error).__name__}: {error}"
+
+    return DQNRolloutResult(
+        worker_id=task.worker_id,
+        trial_index=task.trial_index,
+        trial_number=task.trial_number,
+        batch_number=task.batch_number,
+        seed=task.seed,
+        challenge_number=task.challenge.number,
+        outcome=outcome,
+        ticks=getattr(episode_result, "ticks", 0),
+        total_reward=getattr(episode_result, "total_reward", 0.0),
+        bombs_placed=getattr(episode_result, "bombs_placed", 0),
+        executed_actions=getattr(episode_result, "executed_actions", 0),
+        max_abs_q=getattr(episode_result, "max_abs_q", 0.0),
+        non_finite_q_values=getattr(episode_result, "non_finite_q_values", 0),
+        non_finite_q_fallbacks=getattr(
+            episode_result,
+            "non_finite_q_fallbacks",
+            0,
+        ),
+        error=error_message,
+    )
+
+
+def _run_dqn_rollout_batch(
+    *,
+    agent,
+    assignments: tuple[tuple[Challenge | Drill, int], ...],
+    workers: int,
+    guis: int,
+    batch_number: int,
+    epsilon: float,
+    worker_details: bool = False,
+    time_limit: Optional[int] = None,
+) -> tuple[DQNRolloutResult, ...]:
+    """Run all scheduled DQN episodes from one CPU policy snapshot."""
+    if not assignments:
+        return ()
+    tasks = _make_dqn_rollout_tasks(
+        agent,
+        assignments,
+        workers,
+        guis,
+        batch_number,
+        epsilon,
+        worker_details=worker_details,
+        time_limit=time_limit,
+    )
+    executor = ProcessPoolExecutor(max_workers=min(workers, len(tasks)))
+    results = []
+    try:
+        future_tasks = {
+            executor.submit(_dqn_rollout_worker, task): task
+            for task in tasks
+        }
+        for future in as_completed(future_tasks):
+            task = future_tasks[future]
+            try:
+                result = future.result()
+            except Exception as error:
+                result = DQNRolloutResult(
+                    worker_id=task.worker_id,
+                    trial_index=task.trial_index,
+                    trial_number=task.trial_number,
+                    batch_number=task.batch_number,
+                    seed=task.seed,
+                    challenge_number=task.challenge.number,
+                    outcome="WORKER_ERROR",
+                    error=f"{type(error).__name__}: {error}",
+                )
+            expected_identity = (
+                task.worker_id,
+                task.trial_index,
+                task.trial_number,
+                task.batch_number,
+                task.seed,
+                task.challenge.number,
+            )
+            actual_identity = (
+                result.worker_id,
+                result.trial_index,
+                result.trial_number,
+                result.batch_number,
+                result.seed,
+                result.challenge_number,
+            )
+            if actual_identity != expected_identity:
+                result = replace(
+                    result,
+                    outcome="WORKER_ERROR",
+                    error="worker result identity does not match its scheduled task",
+                )
+            if result.outcome == "TRAINING_ABORTED":
+                raise TrainingAborted(result.error or "DQN rollout was aborted")
+            results.append(result)
+    except KeyboardInterrupt:
+        _terminate_executor_processes(executor)
+        raise
+    except TrainingAborted:
+        _terminate_executor_processes(executor)
+        raise
+    except Exception:
+        _terminate_executor_processes(executor)
+        raise
+    else:
+        executor.shutdown(wait=True, cancel_futures=True)
+
+    # Completion order depends on episode length; restore plan order before replay ingestion.
+    return tuple(sorted(results, key=lambda item: item.trial_index))
 
 
 def _display_callback(game, progress_label: str):
@@ -678,6 +992,202 @@ def _result_is_numerically_stable(result, weights: dict[str, float]) -> bool:
     )
 
 
+def _apply_dqn_overrides(agent, learning_rate, epsilon) -> None:
+    """Apply run-level LR/epsilon overrides after any checkpoint load."""
+    if learning_rate is not None:
+        agent.set_learning_rate(learning_rate)
+    if epsilon is not None:
+        if not math.isfinite(epsilon) or not 0.0 <= epsilon <= 1.0:
+            raise ValueError("--dqn-epsilon must be between 0 and 1")
+        agent.epsilon = epsilon
+    if learning_rate is not None or epsilon is not None:
+        print(
+            "DQN overrides applied: "
+            f"lr={[group['lr'] for group in agent.optimizer.param_groups]} "
+            f"epsilon={agent.epsilon} gamma={agent.gamma} "
+            f"optimizer_steps={agent.optimizer_steps} episodes={agent.episodes}",
+            flush=True,
+        )
+
+
+def _load_dqn_training_state(
+    checkpoint_path: Path,
+    fresh: bool,
+    agent_factory: Callable,
+    learning_rate: Optional[float] = None,
+    epsilon: Optional[float] = None,
+):
+    """Create or restore the canonical DQN learner without touching its checkpoint."""
+    checkpoint_exists = checkpoint_path.is_file()
+    agent = agent_factory()
+    if fresh:
+        if checkpoint_exists:
+            print(
+                "Fresh start requested. Existing DQN checkpoint will remain untouched "
+                "until a valid training batch completes.",
+                flush=True,
+            )
+        else:
+            print("Fresh start requested. Starting with a new DQN.", flush=True)
+        _apply_dqn_overrides(agent, learning_rate, epsilon)
+        return agent, False
+
+    if checkpoint_exists:
+        agent.load_checkpoint(checkpoint_path)
+        print(f"Loaded existing DQN checkpoint from {checkpoint_path}", flush=True)
+        # Loading Adam restores its saved LR; apply the requested run override afterward.
+        _apply_dqn_overrides(agent, learning_rate, epsilon)
+        return agent, False
+
+    print("No DQN checkpoint found. Starting with a new DQN.", flush=True)
+    _apply_dqn_overrides(agent, learning_rate, epsilon)
+    return agent, False
+
+
+def _consume_dqn_episode_results(
+    agent,
+    episode_results: list[object],
+    updates_per_batch: int,
+) -> dict:
+    """Ingest completed rollout transitions, then perform central replay updates."""
+    # Only this parent-side consumer mutates replay, policy parameters, and checkpoint state.
+    transitions_collected = 0
+    for episode_result in episode_results:
+        for transition in getattr(episode_result, "transitions", ()):
+            agent.store_transition(transition)
+            transitions_collected += 1
+
+    updates = []
+    for _ in range(updates_per_batch):
+        agent._central_update_in_progress = True
+        update = agent.train_batch()
+        agent._central_update_in_progress = False
+        if update is None:
+            break
+        updates.append(update)
+
+    return {
+        "transitions_collected": transitions_collected,
+        "replay_size": len(agent.replay_buffer),
+        "replay_capacity": agent.replay_buffer.capacity,
+        "replay_warmup": agent.replay_warmup,
+        "updates_this_batch": len(updates),
+        "optimizer_steps": agent.optimizer_steps,
+        "mean_loss": (
+            math.fsum(update.loss for update in updates) / len(updates)
+            if updates
+            else None
+        ),
+        "mean_abs_td_error": (
+            math.fsum(update.mean_abs_td_error for update in updates) / len(updates)
+            if updates
+            else None
+        ),
+        "max_abs_td_error": max(
+            (update.max_abs_td_error for update in updates),
+            default=None,
+        ),
+        "mean_q": (
+            math.fsum(update.mean_q for update in updates) / len(updates)
+            if updates
+            else None
+        ),
+        "max_abs_q": max((update.max_abs_q for update in updates), default=None),
+        "mean_gradient_norm": (
+            math.fsum(update.gradient_norm for update in updates) / len(updates)
+            if updates
+            else None
+        ),
+        "max_gradient_norm": max(
+            (update.gradient_norm for update in updates),
+            default=None,
+        ),
+        "target_synced": any(update.target_synced for update in updates),
+    }
+
+
+def _print_dqn_batch_summary(metrics: dict) -> None:
+    """Print aggregate central DQN learning diagnostics for one batch."""
+    if metrics.get("worker_limit", 1) > 1:
+        print(
+            f"Parallel DQN rollout: {metrics['episodes_valid']}/"
+            f"{metrics['episodes_assigned']} episodes valid | "
+            f"Worker limit: {metrics['worker_limit']} | "
+            f"Episode errors: {metrics['episode_errors']}",
+            flush=True,
+        )
+    print("DQN learning:", flush=True)
+    print(
+        f"Transitions collected: {metrics['transitions_collected']} | "
+        f"Replay size: {metrics['replay_size']} / {metrics['replay_capacity']} | "
+        f"Warmup: {metrics['replay_size']} / {metrics['replay_warmup']}",
+        flush=True,
+    )
+    print(
+        f"Optimizer steps this batch: {metrics['updates_this_batch']} | "
+        f"Total optimizer steps: {metrics['optimizer_steps']}",
+        flush=True,
+    )
+    if metrics["updates_this_batch"]:
+        print(
+            f"Mean loss: {metrics['mean_loss']:.3f} | "
+            f"Mean |TD|: {metrics['mean_abs_td_error']:.3f} | "
+            f"Max |TD|: {metrics['max_abs_td_error']:.3f} | "
+            f"Mean Q: {metrics['mean_q']:.3f} | "
+            f"Max |Q|: {metrics['max_abs_q']:.3f} | "
+            f"Mean gradient norm: {metrics['mean_gradient_norm']:.3f} | "
+            f"Max gradient norm: {metrics['max_gradient_norm']:.3f} | "
+            f"Target synced: {'yes' if metrics['target_synced'] else 'no'}",
+            flush=True,
+        )
+    else:
+        print(
+            (
+                "No optimizer update: replay warmup has not been reached "
+                f"({metrics['replay_size']}/{metrics['replay_warmup']} transitions)."
+            )
+            if metrics["replay_size"] < metrics["replay_warmup"]
+            else "No optimizer update was performed.",
+            flush=True,
+        )
+
+
+def _dqn_result_is_numerically_stable(result) -> bool:
+    return (
+        getattr(result, "error", None) is None
+        and result.outcome not in {"WORKER_ERROR", "TRAINING_ABORTED"}
+        and getattr(result, "policy_unchanged", True)
+        and getattr(result, "gradients_absent", True)
+        and getattr(result, "optimizer_steps", 0) == 0
+        and getattr(result, "target_sync_count", 0) == 0
+        and result.outcome != "NON_FINITE"
+        and result.non_finite_q_values == 0
+        and result.non_finite_q_fallbacks == 0
+        and math.isfinite(result.total_reward)
+        and math.isfinite(result.max_abs_q)
+    )
+
+
+def _dqn_rollout_coverage(
+    episode_items: tuple[int, ...],
+    results: tuple[DQNRolloutResult, ...],
+) -> tuple[dict[int, int], tuple[int, ...]]:
+    valid_counts = {
+        item_number: sum(
+            result.challenge_number == item_number
+            and _dqn_result_is_numerically_stable(result)
+            for result in results
+        )
+        for item_number in sorted(set(episode_items))
+    }
+    missing_items = tuple(
+        item_number
+        for item_number, valid_count in valid_counts.items()
+        if valid_count == 0
+    )
+    return valid_counts, missing_items
+
+
 def _trial_rounds(trials: int, workers: int) -> tuple[tuple[int, ...], ...]:
     return tuple(
         tuple(range(start, min(start + workers, trials + 1)))
@@ -858,6 +1368,7 @@ def _phase_history_fields(
 
 
 def _required_newest_wins(survive: int, trials: int, newest_episodes: int) -> int:
+    """Scale the configured survive/trials threshold to the newest item's share."""
     return math.ceil((survive / trials) * newest_episodes)
 
 
@@ -950,6 +1461,321 @@ def _frozen_evaluation_is_due(
         )
     )
 
+
+def _curriculum_items(phase: str):
+    items = drill_progression() if phase == "drill" else progression()
+    return items, {item.number: item for item in items}
+
+
+@dataclass(frozen=True)
+class BatchDecision:
+    """Curriculum outcome of one completed training batch."""
+
+    newest_item: int
+    newest_wins: int
+    required_newest_wins: int
+    stage_unlocked: bool
+    phase_transitioned: bool
+    evaluation_due: bool
+    progress_detected: bool = False
+
+
+@dataclass(frozen=True)
+class EvaluationDecision:
+    """Curriculum outcome of one all-variant frozen evaluation."""
+
+    complete: bool
+    improved: Optional[bool]
+    focus_variant: Optional[int]
+    previous_focus: Optional[int]
+    progress_detected: bool = False
+
+
+class CurriculumEngine:
+    """Backend-agnostic curriculum decisions (unlock, focus, stagnation, refresh).
+
+    Pure state machine: no I/O, no agent. Callers run episodes and feed results
+    back through ``plan_batch()`` and ``record_batch()``. Unlocking uses the
+    configured ``survive / trials`` threshold, scaled to the newest item's share
+    of the batch. Once every variant is unlocked, separate frozen evaluations
+    apply ``FINAL_WIN_RATE_THRESHOLD`` and select a focus variant. Stagnation
+    counts completed training episodes; drill refreshes reset that counter but
+    never unlock variants. Every decision is recorded as deterministic,
+    JSON-serializable trace data.
+    """
+
+    def __init__(
+        self,
+        *,
+        trials: int,
+        survive: int,
+        seed: int,
+        eval_trials: int,
+        curriculum: str = "drills",
+        focus_batches: int = 1,
+        drill_refresh_after: int = 0,
+        no_training: bool = False,
+        start_variant: Optional[int] = None,
+    ) -> None:
+        self.trials = trials
+        self.survive = survive
+        self.seed = seed
+        self.eval_trials = eval_trials
+        self.curriculum = curriculum
+        self.focus_batches = focus_batches
+        self.drill_refresh_after = drill_refresh_after
+        self.no_training = no_training
+        self.drill_count = len(drill_progression())
+        self.variant_count = len(progression())
+        self.phase = "drill" if curriculum == "drills" else "variant"
+        self.unlocked_items = [1]
+        self.phase_batch = 0
+        self.phase_seed = seed ^ DRILL_SEED_OFFSET if self.phase == "drill" else seed
+        if start_variant is not None:
+            if not 1 <= start_variant <= self.variant_count:
+                raise ValueError(
+                    f"start_variant must be between 1 and {self.variant_count}"
+                )
+            # Start after the V1..N availability point, not its pass threshold:
+            # V1..N are available, N is still the newest stage, and N+1 stays locked.
+            self.phase = "variant"
+            self.unlocked_items = list(range(1, start_variant + 1))
+            self.phase_seed = (
+                seed ^ DRILL_VARIANT_SEED_OFFSET if curriculum == "drills" else seed
+            )
+        self.focus_variant: Optional[int] = None
+        self.batches_since_evaluation = 0
+        self.last_evaluation_win_rates: dict[int, float] = {}
+        self.stagnation_trials = 0
+        self.drill_refresh_count = 0
+        self.completed_batches = 0
+        self.complete = False
+        self.trace: list[dict] = []
+        self._plan: Optional[TrainingBatchPlan] = None
+        self._batch_phase = self.phase
+        self._batch_focus: Optional[int] = None
+        self._batch_last_rates: dict[int, float] = {}
+        self._evaluation_due = False
+
+    @property
+    def item_count(self) -> int:
+        return self.drill_count if self.phase == "drill" else self.variant_count
+
+    @property
+    def all_variants_unlocked(self) -> bool:
+        return self.phase == "variant" and len(self.unlocked_items) == self.variant_count
+
+    @property
+    def newest_item(self) -> int:
+        return self.unlocked_items[-1]
+
+    @property
+    def batch_phase(self) -> str:
+        return self._batch_phase
+
+    @property
+    def batch_focus_variant(self) -> Optional[int]:
+        return self._batch_focus
+
+    @property
+    def batch_last_evaluation_win_rates(self) -> dict[int, float]:
+        return dict(self._batch_last_rates)
+
+    def plan_batch(self) -> TrainingBatchPlan:
+        self.phase_batch += 1
+        self._batch_phase = self.phase
+        self._batch_focus = (
+            self.focus_variant
+            if self.all_variants_unlocked and not self.no_training
+            else None
+        )
+        self._batch_last_rates = dict(self.last_evaluation_win_rates)
+        self._evaluation_due = False
+        self._plan = _plan_training_batch(
+            self.trials,
+            self.survive,
+            self.unlocked_items,
+            self.phase_seed,
+            self.phase_batch,
+            focus_variant=self._batch_focus,
+        )
+        self.trace.append(
+            {
+                "event": "plan",
+                "batch": self.completed_batches + 1,
+                "phase": self._batch_phase,
+                "unlocked": list(self.unlocked_items),
+                "focus": self._batch_focus,
+                "episode_items": list(self._plan.episode_items),
+                "required_newest_wins": self._plan.required_newest_wins,
+            }
+        )
+        return self._plan
+
+    def record_batch(
+        self,
+        results: list[tuple[int, object]],
+        *,
+        trained_episodes: Optional[int] = None,
+        require_error_free: bool = False,
+    ) -> BatchDecision:
+        """Apply unlock/stagnation rules to a completed training batch.
+
+        Only wins on the newest scheduled item can unlock the next item; this
+        batch result does not substitute for the later frozen final evaluation.
+        """
+        if self._plan is None:
+            raise RuntimeError("record_batch() requires a preceding plan_batch()")
+        plan = self._plan
+        batch_phase = self._batch_phase
+        newest_item = self.newest_item
+        wins = _count_newest_item_wins(
+            results, newest_item, require_error_free=require_error_free
+        )
+        required = plan.required_newest_wins
+        self.completed_batches += 1
+        unlocked = False
+        transitioned = False
+        progress = False
+        if self._batch_focus is not None:
+            self.batches_since_evaluation += 1
+        elif wins >= required and newest_item < self.item_count:
+            self.unlocked_items.append(newest_item + 1)
+            unlocked = True
+            if batch_phase == "variant" and not self.no_training:
+                self.stagnation_trials = 0
+                progress = True
+        elif newest_item == self.item_count and wins >= required:
+            if batch_phase == "drill":
+                transitioned = True
+                self.phase = "variant"
+                self.unlocked_items = [1]
+                self.phase_batch = 0
+                self.phase_seed = (
+                    self.seed ^ DRILL_VARIANT_SEED_OFFSET
+                    if self.curriculum == "drills"
+                    else self.seed
+                )
+        if batch_phase == "variant" and not self.no_training and not unlocked:
+            self.stagnation_trials += (
+                len(plan.episode_items) if trained_episodes is None else trained_episodes
+            )
+        self._evaluation_due = (
+            batch_phase == "variant"
+            and len(self.unlocked_items) == self.variant_count
+            and _frozen_evaluation_is_due(
+                phase=batch_phase,
+                all_variants_unlocked=True,
+                no_training=self.no_training,
+                focus_variant=self.focus_variant,
+                batches_since_evaluation=self.batches_since_evaluation,
+                focus_batches=self.focus_batches,
+            )
+        )
+        self.trace.append(
+            {
+                "event": "batch",
+                "batch": self.completed_batches,
+                "phase": batch_phase,
+                "newest_item": newest_item,
+                "newest_wins": wins,
+                "required_newest_wins": required,
+                "unlocked": unlocked,
+                "phase_transitioned": transitioned,
+                "evaluation_due": self._evaluation_due,
+                "stagnation_trials": self.stagnation_trials,
+                "unlocked_items": list(self.unlocked_items),
+            }
+        )
+        return BatchDecision(
+            newest_item,
+            wins,
+            required,
+            unlocked,
+            transitioned,
+            self._evaluation_due,
+            progress,
+        )
+
+    def record_evaluation(
+        self,
+        win_rates: dict[int, float],
+        *,
+        complete: bool,
+    ) -> EvaluationDecision:
+        """Record a frozen all-variant evaluation and update focus/completion."""
+        if not self._evaluation_due:
+            raise RuntimeError("record_evaluation() requires evaluation_due")
+        variants = tuple(range(1, self.variant_count + 1))
+        improved: Optional[bool] = None
+        progress = False
+        if not complete and not self.no_training:
+            focus_for_progress = (
+                self._batch_focus
+                if self._batch_focus is not None
+                else self.focus_variant
+            )
+            if not self._batch_last_rates:
+                self.stagnation_trials = 0
+                progress = True
+            else:
+                improved = _frozen_evaluation_improved(
+                    self._batch_last_rates,
+                    win_rates,
+                    self.eval_trials,
+                    focus_for_progress,
+                    variants,
+                )
+                if improved:
+                    self.stagnation_trials = 0
+                    progress = True
+        self.last_evaluation_win_rates = dict(win_rates)
+        previous = self.focus_variant
+        if not complete:
+            self.focus_variant = _select_weakest_variant(win_rates, variants)
+            self.batches_since_evaluation = 0
+        self.complete = complete
+        self.trace.append(
+            {
+                "event": "evaluation",
+                "batch": self.completed_batches,
+                "win_rates": {str(v): win_rates[v] for v in sorted(win_rates)},
+                "complete": complete,
+                "improved": improved,
+                "progress_detected": progress,
+                "focus": self.focus_variant,
+                "stagnation_trials": self.stagnation_trials,
+            }
+        )
+        return EvaluationDecision(
+            complete, improved, self.focus_variant, previous, progress
+        )
+
+    def refresh_due(self, *, evaluation_performed: bool) -> bool:
+        return _drill_refresh_is_due(
+            curriculum=self.curriculum,
+            no_training=self.no_training,
+            phase=self._batch_phase,
+            stagnation_trials=self.stagnation_trials,
+            refresh_after=self.drill_refresh_after,
+            final_complete=self.complete,
+            all_variants_unlocked=len(self.unlocked_items) == self.variant_count,
+            evaluation_performed=evaluation_performed,
+        )
+
+    def refresh_completed(self) -> None:
+        """Unlock/focus progress is kept; only the stagnation counter resets."""
+        self.drill_refresh_count += 1
+        self.stagnation_trials = 0
+        self.trace.append(
+            {
+                "event": "drill_refresh",
+                "batch": self.completed_batches,
+                "refresh_count": self.drill_refresh_count,
+                "unlocked_items": list(self.unlocked_items),
+                "focus": self.focus_variant,
+            }
+        )
 
 def _weight_update_diagnostics(
     round_start_weights: dict[str, float],
@@ -1836,7 +2662,7 @@ def _run_sequential_drill_refresh(
     refresh_number: int,
     batch_number: int,
     round_counter: int,
-    weights: dict[str, float],
+    weights: Optional[dict[str, float]],
     save_agent,
     weights_path: Path,
     summary: TrainingSummary,
@@ -1848,7 +2674,11 @@ def _run_sequential_drill_refresh(
     no_training: bool,
     history_path: Optional[Path],
     worker_details: bool = False,
-) -> tuple[int, dict[str, float], object, dict[int, dict[str, float | int]]]:
+    agent_type: str = "q",
+    dqn_updates_per_batch: int = DQN_UPDATES_PER_BATCH,
+    workers: int = 1,
+    guis: int = 0,
+) -> tuple[int, Optional[dict[str, float]], object, dict[int, dict[str, float | int]]]:
     """Replay every drill sequentially and return updated weights and aggregates."""
     if no_training:
         raise ValueError("drill refresh cannot run in no-training mode")
@@ -1861,23 +2691,87 @@ def _run_sequential_drill_refresh(
         ticks_total = 0
         td_total = 0.0
         canonical_delta_total = 0.0
+        dqn_episode_results = []
+        parallel_drill_results = None
+        drill_batch_failed = False
+        if agent_type == "dqn" and workers > 1:
+            rollout_agent = agent_factory()
+            assignments = tuple(
+                (
+                    drill,
+                    seed
+                    ^ DRILL_REFRESH_SEED_OFFSET
+                    ^ (refresh_number * 0x9E3779B1)
+                    ^ (drill.number * 0x85EBCA77)
+                    ^ trial_number,
+                )
+                for trial_number in range(1, refresh_trials + 1)
+            )
+            parallel_drill_results = _run_dqn_rollout_batch(
+                agent=rollout_agent,
+                assignments=assignments,
+                workers=workers,
+                guis=guis,
+                batch_number=batch_number,
+                epsilon=rollout_agent.epsilon,
+                worker_details=worker_details,
+            )
+            _, missing_items = _dqn_rollout_coverage(
+                (drill.number,) * refresh_trials,
+                parallel_drill_results,
+            )
+            failed_results = [
+                result
+                for result in parallel_drill_results
+                if not _dqn_result_is_numerically_stable(result)
+            ]
+            for result in failed_results:
+                print(
+                    f"WARNING: DQN drill-refresh worker {result.worker_id} trial "
+                    f"{result.trial_index} D{result.challenge_number} "
+                    f"{result.outcome}: {result.error or 'invalid rollout result'}",
+                    flush=True,
+                )
+            if missing_items:
+                summary.stopped_reason = (
+                    f"DQN drill refresh D{drill.number} had no valid rollout "
+                    "results; no replay updates or checkpoint save performed"
+                )
+                drill_batch_failed = True
         for trial_number in range(1, refresh_trials + 1):
+            if drill_batch_failed:
+                break
             round_counter += 1
-            start_weights = dict(weights)
+            start_weights = dict(weights) if weights is not None else None
             episode_seed = (
-                seed
-                ^ DRILL_REFRESH_SEED_OFFSET
-                ^ (refresh_number * 0x9E3779B1)
-                ^ (drill.number * 0x85EBCA77)
-                ^ trial_number
+                assignments[trial_number - 1][1]
+                if parallel_drill_results is not None
+                else (
+                    seed
+                    ^ DRILL_REFRESH_SEED_OFFSET
+                    ^ (refresh_number * 0x9E3779B1)
+                    ^ (drill.number * 0x85EBCA77)
+                    ^ trial_number
+                )
             )
-            game, active_agent = game_factory(
-                drill,
-                episode_seed,
-                weights,
-                agent_factory,
-            )
-            active_agent.set_learning(False, epsilon=active_agent.epsilon)
+            if parallel_drill_results is not None:
+                active_agent = agent_factory()
+                game = None
+                result = parallel_drill_results[trial_number - 1]
+            else:
+                game, active_agent = game_factory(
+                    drill,
+                    episode_seed,
+                    weights,
+                    agent_factory,
+                )
+            if agent_type == "dqn" and parallel_drill_results is None:
+                active_agent.set_rollout(
+                    epsilon=active_agent.epsilon,
+                    collect_experience=True,
+                )
+            elif agent_type == "q":
+                active_agent.set_learning(False, epsilon=active_agent.epsilon)
             active_agent.q_contributions_diagnostic = q_contributions_diagnostic
             updates_before = getattr(active_agent, "td_update_count", 0)
             label = (
@@ -1885,28 +2779,56 @@ def _run_sequential_drill_refresh(
                 f"Episode {trial_number}/{refresh_trials} | "
                 f"Global episode {summary.completed_trials + 1}"
             )
-            result = episode_runner(
-                game,
-                active_agent,
-                summary.completed_trials + 1,
-                label,
-                display,
-            )
-            summary.completed_trials += 1
-            stable = _result_is_numerically_stable(result, active_agent.weights)
-            if stable:
-                weights = dict(active_agent.weights)
-                save_agent = active_agent
-                _save_weights(save_agent, weights, weights_path)
-                summary.weights_saved = True
-            else:
-                weights = start_weights
-                active_agent.weights = dict(start_weights)
-                print(
-                    f"WARNING: Drill refresh D{drill.number} returned unstable weights; "
-                    "retaining the last canonical vector.",
-                    flush=True,
+            if parallel_drill_results is None:
+                result = episode_runner(
+                    game,
+                    active_agent,
+                    summary.completed_trials + 1,
+                    label,
+                    display,
                 )
+            if agent_type == "dqn":
+                stable = _dqn_result_is_numerically_stable(result)
+                if stable:
+                    dqn_episode_results.append(result)
+                    if parallel_drill_results is not None:
+                        summary.completed_trials += 1
+                elif parallel_drill_results is not None:
+                    _append_history_record(
+                        history_path,
+                        {
+                            "record_type": "training_round",
+                            "agent": "dqn",
+                            "batch": batch_number,
+                            "round": round_counter,
+                            "phase": "drill_refresh",
+                            "curriculum_item": drill.number,
+                            "worker_id": result.worker_id,
+                            "trial_index": result.trial_index,
+                            "seed": result.seed,
+                            "outcome": result.outcome,
+                            "error": result.error,
+                        },
+                    )
+                    continue
+            else:
+                stable = _result_is_numerically_stable(result, active_agent.weights)
+            if parallel_drill_results is None:
+                summary.completed_trials += 1
+            if agent_type == "q":
+                if stable:
+                    weights = dict(active_agent.weights)
+                    save_agent = active_agent
+                    _save_weights(save_agent, weights, weights_path)
+                    summary.weights_saved = True
+                else:
+                    weights = start_weights
+                    active_agent.weights = dict(start_weights)
+                    print(
+                        f"WARNING: Drill refresh D{drill.number} returned unstable weights; "
+                        "retaining the last canonical vector.",
+                        flush=True,
+                    )
 
             wins += result.outcome == "WON" and stable
             losses += result.outcome in {"LOST", "TIMEOUT"} and stable
@@ -1917,22 +2839,41 @@ def _run_sequential_drill_refresh(
                 result, "td_update_count", getattr(active_agent, "td_update_count", 0)
             )
             td_total += td_error
-            diagnostics = _weight_update_diagnostics(
-                start_weights,
-                [dict(active_agent.weights)] if stable else [],
-                weights,
-                [(td_error, update_count)] if stable else [],
-                getattr(result, "max_abs_q", 0.0),
-            )
-            diagnostics["merge_strategy"] = "single_worker"
-            diagnostics["genetic_child_delta_l2"] = None
-            canonical_delta_total += diagnostics["canonical_delta_l2"]
-            if worker_details:
-                _print_learning_progress(diagnostics)
+            if agent_type == "q":
+                diagnostics = _weight_update_diagnostics(
+                    start_weights,
+                    [dict(active_agent.weights)] if stable else [],
+                    weights,
+                    [(td_error, update_count)] if stable else [],
+                    getattr(result, "max_abs_q", 0.0),
+                )
+                diagnostics["merge_strategy"] = "single_worker"
+                diagnostics["genetic_child_delta_l2"] = None
+                canonical_delta_total += diagnostics["canonical_delta_l2"]
+                if worker_details:
+                    _print_learning_progress(diagnostics)
+                history_record = {
+                    "weights": dict(weights),
+                    **diagnostics,
+                }
+            else:
+                history_record = {
+                    "outcome": result.outcome,
+                    "ticks": result.ticks,
+                    "total_reward": result.total_reward,
+                    "bombs_placed": result.bombs_placed,
+                    "worker_id": getattr(result, "worker_id", 0),
+                    "trial_index": getattr(result, "trial_index", trial_number),
+                    "seed": getattr(result, "seed", episode_seed),
+                    "transitions_collected": len(
+                        getattr(result, "transitions", ())
+                    ),
+                }
             _append_history_record(
                 history_path,
                 {
                     "record_type": "training_round",
+                    "agent": agent_type,
                     "batch": batch_number,
                     "round": round_counter,
                     "phase": "drill_refresh",
@@ -1941,28 +2882,95 @@ def _run_sequential_drill_refresh(
                     "episode_drills": [drill.number],
                     "training_enabled": True,
                     "training_mode": "drill_refresh",
-                    **diagnostics,
-                    "weights": dict(weights),
+                    **history_record,
                 },
             )
+        if agent_type == "dqn" and dqn_episode_results:
+            active_agent.set_learning(
+                no_training=False,
+                epsilon=active_agent.epsilon,
+            )
+            refresh_metrics = _consume_dqn_episode_results(
+                active_agent,
+                dqn_episode_results,
+                dqn_updates_per_batch,
+            )
+            assigned_refresh_episodes = (
+                len(parallel_drill_results)
+                if parallel_drill_results is not None
+                else len(dqn_episode_results)
+            )
+            refresh_metrics.update(
+                worker_limit=min(workers, assigned_refresh_episodes),
+                episodes_assigned=(
+                    assigned_refresh_episodes
+                ),
+                episodes_valid=len(dqn_episode_results),
+                episode_errors=(
+                    len(parallel_drill_results) - len(dqn_episode_results)
+                    if parallel_drill_results is not None
+                    else 0
+                ),
+            )
+            _print_dqn_batch_summary(refresh_metrics)
+            if dqn_episode_results:
+                active_agent.save_checkpoint(weights_path)
+                summary.weights_saved = True
+            if refresh_metrics["mean_abs_td_error"] is not None:
+                mean_td_error = refresh_metrics["mean_abs_td_error"]
+            else:
+                mean_td_error = 0.0
+        else:
+            refresh_metrics = None
+            mean_td_error = td_total / refresh_trials
         drill_results[drill.number] = {
             "wins": int(wins),
             "losses": int(losses),
             "attempts": refresh_trials,
             "mean_reward": reward_total / refresh_trials,
             "mean_ticks": ticks_total / refresh_trials,
-            "mean_abs_td_error": td_total / refresh_trials,
-            "mean_canonical_delta_l2": canonical_delta_total / refresh_trials,
+            "mean_abs_td_error": mean_td_error,
+            **(
+                {
+                    "transitions_collected": refresh_metrics[
+                        "transitions_collected"
+                    ],
+                    "optimizer_steps": refresh_metrics["updates_this_batch"],
+                    "episode_errors": (
+                        len(parallel_drill_results) - len(dqn_episode_results)
+                        if parallel_drill_results is not None
+                        else 0
+                    ),
+                }
+                if refresh_metrics is not None
+                else {
+                    "mean_canonical_delta_l2": (
+                        canonical_delta_total / refresh_trials
+                    )
+                }
+            ),
         }
-        print(
+        summary_text = (
             f"Drill refresh D{drill.number} results: {wins} wins, "
             f"{losses} losses / {refresh_trials} attempts | "
             f"Mean reward: {reward_total / refresh_trials:.1f} | "
             f"Mean ticks: {ticks_total / refresh_trials:.1f} | "
-            f"Mean |TD|: {td_total / refresh_trials:.3f} | "
-            f"Mean canonical delta L2: {canonical_delta_total / refresh_trials:.4f}",
-            flush=True,
+            f"Mean |TD|: {mean_td_error:.3f}"
         )
+        if refresh_metrics is not None:
+            summary_text += (
+                f" | Transitions: {refresh_metrics['transitions_collected']} "
+                f"| Optimizer steps: {refresh_metrics['updates_this_batch']}"
+            )
+        else:
+            summary_text += (
+                f" | Mean canonical delta L2: "
+                f"{canonical_delta_total / refresh_trials:.4f}"
+            )
+        print(summary_text, flush=True)
+        if drill_batch_failed:
+            drill_results[drill.number]["batch_rejected"] = True
+            break
         if wins == 0:
             print(
                 f"WARNING: Drill refresh D{drill.number} produced 0/{refresh_trials} wins. "
@@ -2241,7 +3249,7 @@ def _print_frozen_evaluation(
 
 def _evaluate_batch(
     unlocked_challenges: tuple[Challenge, ...],
-    weights: dict[str, float],
+    weights: Optional[dict[str, float]],
     eval_trials: int,
     seed: int,
     workers: int,
@@ -2251,9 +3259,28 @@ def _evaluate_batch(
     history_path: Optional[Path],
     eval_timeout_seconds: float,
     worker_details: bool = False,
+    frozen_evaluator: Optional[Callable] = None,
 ) -> tuple[dict[int, float], dict[int, int], bool, dict]:
     """Evaluate unlocked variants and return rates, counts, completion, and details."""
-    if evaluation_runner is None:
+    if evaluation_runner is not None:
+        rates, valid_counts = evaluation_runner(
+            unlocked_challenges=unlocked_challenges,
+            weights=dict(weights) if weights is not None else None,
+            eval_trials=eval_trials,
+            seed=seed,
+            workers=workers,
+            batch_number=batch_number,
+            learning_parameters=learning_parameters,
+        )
+        evaluation_details = {"timed_out_counts": {}, "skipped_variants": []}
+    elif frozen_evaluator is not None:
+        rates, valid_counts, evaluation_details = frozen_evaluator(
+            unlocked_challenges=unlocked_challenges,
+            eval_trials=eval_trials,
+            seed=seed,
+            batch_number=batch_number,
+        )
+    else:
         rates, valid_counts, evaluation_details = _evaluate_frozen_policy(
             unlocked_challenges,
             weights,
@@ -2265,17 +3292,6 @@ def _evaluate_batch(
             eval_timeout_seconds,
             worker_details,
         )
-    else:
-        rates, valid_counts = evaluation_runner(
-            unlocked_challenges=unlocked_challenges,
-            weights=dict(weights),
-            eval_trials=eval_trials,
-            seed=seed,
-            workers=workers,
-            batch_number=batch_number,
-            learning_parameters=learning_parameters,
-        )
-        evaluation_details = {"timed_out_counts": {}, "skipped_variants": []}
 
     completed = _print_frozen_evaluation(
         tuple(challenge.number for challenge in unlocked_challenges),
@@ -2309,6 +3325,118 @@ def _evaluate_batch(
         },
     )
     return rates, valid_counts, completed, evaluation_details
+
+
+def _evaluate_dqn_policy(
+    agent,
+    unlocked_challenges: tuple[Challenge, ...],
+    eval_trials: int,
+    seed: int,
+    batch_number: int,
+    game_factory: Callable,
+    episode_runner: Callable,
+    timeout_seconds: float,
+) -> tuple[dict[int, float], dict[int, int], dict]:
+    """Evaluate a canonical DQN frozen in place without changing learner state."""
+    from team01.agent.deep_q_learning import checkpoint_snapshots_equal
+
+    snapshot_before = agent.get_checkpoint_snapshot()
+    replay_size_before = len(agent.replay_buffer)
+    episodes_before = agent.episodes
+    was_training = agent.training
+    was_learning_enabled = agent.learning_enabled
+    was_collecting = agent.collect_experience
+    previous_epsilon = agent.epsilon
+    rates: dict[int, float] = {}
+    valid_counts: dict[int, int] = {}
+    timeout_counts: dict[int, int] = {}
+    skipped_variants = []
+    timed_out = False
+
+    try:
+        agent.set_learning(no_training=True, epsilon=0.0)
+        for challenge_index, challenge in enumerate(unlocked_challenges):
+            wins = 0
+            valid = 0
+            timeouts = 0
+            for trial_number in range(1, eval_trials + 1):
+                episode_seed = (
+                    seed
+                    + (1 << 32)
+                    + (challenge.number - 1) * eval_trials
+                    + trial_number
+                )
+                game, evaluation_agent = game_factory(
+                    challenge,
+                    episode_seed,
+                    None,
+                    lambda: agent,
+                )
+                evaluation_agent.set_learning(no_training=True, epsilon=0.0)
+                if episode_runner is _run_episode or getattr(
+                    episode_runner, "func", None
+                ) is _run_episode:
+                    try:
+                        result = _run_frozen_evaluation_episode(
+                            game,
+                            evaluation_agent,
+                            trial_number,
+                            timeout_seconds,
+                        )
+                    except FrozenEvaluationTimeout:
+                        timeouts += 1
+                        timed_out = True
+                        break
+                else:
+                    result = episode_runner(
+                        game,
+                        evaluation_agent,
+                        trial_number,
+                        f"DQN frozen evaluation V{challenge.number} "
+                        f"{trial_number}/{eval_trials}",
+                        False,
+                    )
+                if _dqn_result_is_numerically_stable(result):
+                    valid += 1
+                    wins += result.outcome == "WON"
+            valid_counts[challenge.number] = valid
+            rates[challenge.number] = wins / eval_trials
+            timeout_counts[challenge.number] = timeouts
+            if timed_out:
+                skipped_variants = [
+                    item.number
+                    for item in unlocked_challenges[challenge_index + 1 :]
+                ]
+                for item_number in skipped_variants:
+                    rates[item_number] = 0.0
+                    valid_counts[item_number] = 0
+                    timeout_counts[item_number] = 0
+                break
+    finally:
+        agent.episodes = episodes_before
+        unchanged = (
+            checkpoint_snapshots_equal(
+                snapshot_before,
+                agent.get_checkpoint_snapshot(),
+            )
+            and len(agent.replay_buffer) == replay_size_before
+        )
+        if was_training and was_learning_enabled and was_collecting:
+            agent.set_learning(no_training=False, epsilon=previous_epsilon)
+        elif was_collecting:
+            agent.set_rollout(
+                epsilon=previous_epsilon,
+                collect_experience=True,
+            )
+        else:
+            agent.set_learning(no_training=True, epsilon=0.0)
+        if not unchanged:
+            raise RuntimeError("Frozen DQN evaluation mutated the training learner")
+
+    return rates, valid_counts, {
+        "timed_out_counts": timeout_counts,
+        "skipped_variants": skipped_variants,
+    }
 
 
 def _maybe_warn_stale_policy(
@@ -2387,12 +3515,22 @@ def _run_parallel_curriculum(
     round_counter = 0
     variant_items = progression()
     drill_items = drill_progression()
-    phase = "drill" if curriculum == "drills" else "variant"
-    active_items = drill_items if phase == "drill" else variant_items
-    item_by_number = {item.number: item for item in active_items}
-    unlocked_items = [1]
-    phase_batch = 0
-    phase_seed = base_seed ^ DRILL_SEED_OFFSET if phase == "drill" else base_seed
+    engine = CurriculumEngine(
+        trials=trials,
+        survive=survive,
+        seed=base_seed,
+        eval_trials=eval_trials,
+        curriculum=curriculum,
+        focus_batches=focus_batches,
+        drill_refresh_after=drill_refresh_after,
+        no_training=no_training,
+    )
+    summary.decision_trace = engine.trace
+    phase = engine.phase
+    active_items, item_by_number = _curriculum_items(phase)
+    unlocked_items = engine.unlocked_items
+    phase_batch = engine.phase_batch
+    phase_seed = engine.phase_seed
     recent_batches = deque(maxlen=STALE_WINDOW)
     focus_variant: Optional[int] = None
     batches_since_evaluation = 0
@@ -2408,19 +3546,15 @@ def _run_parallel_curriculum(
             break
 
         batch_number = summary.completed_batches + 1
-        phase_batch += 1
         summary.current_batch = batch_number
-        batch_phase = phase
+        batch_plan = engine.plan_batch()
+        phase_batch = engine.phase_batch
+        batch_phase = engine.batch_phase
         batch_unlocked_items = tuple(unlocked_items)
         newest_item = unlocked_items[-1]
         summary.current_stage = item_by_number[newest_item]
-        post_unlock_phase = (
-            phase == "variant" and len(unlocked_items) == len(variant_items)
-        )
-        batch_last_evaluation_win_rates = dict(last_evaluation_win_rates)
-        batch_focus_variant = (
-            focus_variant if post_unlock_phase and not no_training else None
-        )
+        batch_last_evaluation_win_rates = engine.batch_last_evaluation_win_rates
+        batch_focus_variant = engine.batch_focus_variant
         focus_batch_index = (
             batches_since_evaluation + 1 if batch_focus_variant is not None else None
         )
@@ -2428,14 +3562,6 @@ def _run_parallel_curriculum(
             "weakest_variant_focus"
             if batch_focus_variant is not None
             else ("read_only" if no_training else f"progressive_{phase}")
-        )
-        batch_plan = _plan_training_batch(
-            trials,
-            survive,
-            unlocked_items,
-            phase_seed,
-            phase_batch,
-            focus_variant=batch_focus_variant,
         )
         episode_items = batch_plan.episode_items
         distribution = batch_plan.distribution
@@ -2683,11 +3809,6 @@ def _run_parallel_curriculum(
         # Unlock progress depends on wins for the newest drill or variant.
         newest_count = distribution.get(newest_item, 0)
         required_wins = batch_plan.required_newest_wins
-        newest_wins = _count_newest_item_wins(
-            batch_results,
-            newest_item,
-            require_error_free=True,
-        )
         _print_mixed_batch_summary(
             episode_items,
             batch_results,
@@ -2700,20 +3821,25 @@ def _run_parallel_curriculum(
         if batch_focus_variant is not None:
             _print_focus_variant_results(batch_focus_variant, batch_results)
         summary.completed_batches += 1
-        phase_transitioned = False
-        stage_unlocked = False
-        frozen_progress_detected = False
+        decision = engine.record_batch(batch_results, require_error_free=True)
+        phase = engine.phase
+        active_items, item_by_number = _curriculum_items(phase)
+        unlocked_items = engine.unlocked_items
+        phase_batch = engine.phase_batch
+        phase_seed = engine.phase_seed
+        batches_since_evaluation = engine.batches_since_evaluation
+        variant_stagnation_trials = engine.stagnation_trials
+        newest_wins = decision.newest_wins
+        phase_transitioned = decision.phase_transitioned
+        stage_unlocked = decision.stage_unlocked
+        frozen_progress_detected = decision.progress_detected
 
         if batch_focus_variant is not None:
-            batches_since_evaluation += 1
-        elif newest_wins >= required_wins and newest_item < len(active_items):
-            unlocked_items.append(newest_item + 1)
+            pass
+        elif stage_unlocked:
             summary.stages_passed += 1
             summary.current_stage = item_by_number[newest_item + 1]
-            stage_unlocked = True
-            if batch_phase == "variant" and not no_training:
-                variant_stagnation_trials = 0
-                frozen_progress_detected = True
+            if frozen_progress_detected:
                 print(
                     f"Variant progress detected: V{newest_item + 1} unlocked. "
                     "Stagnation counter reset.",
@@ -2725,37 +3851,27 @@ def _run_parallel_curriculum(
                 f"{item_prefix[0]}{newest_item + 1} unlocked",
                 flush=True,
             )
-        elif newest_item == len(active_items) and newest_wins >= required_wins:
-            if batch_phase == "drill":
-                phase_transitioned = True
-                print(
-                    f"\n{'=' * 54}\nDRILL CURRICULUM COMPLETE\n"
-                    f"{'=' * 54}\nAll skill drills passed.\n\n"
-                    "Carrying learned weights into the Project 2 variant curriculum.\n"
-                    "Starting Variant 1.\n"
-                    f"{'=' * 54}",
-                    flush=True,
-                )
-                phase = "variant"
-                active_items = variant_items
-                item_by_number = {
-                    item.number: item for item in variant_items
-                }
-                unlocked_items = [1]
-                phase_batch = 0
-                phase_seed = (
-                    base_seed ^ DRILL_VARIANT_SEED_OFFSET
-                    if curriculum == "drills"
-                    else base_seed
-                )
-                recent_batches.clear()
-                summary.current_stage = item_by_number[1]
-            else:
-                print(
-                    f"Newest variant V{newest_item} met its training ratio; "
-                    "final frozen evaluation still controls completion.",
-                    flush=True,
-                )
+        elif phase_transitioned:
+            print(
+                f"\n{'=' * 54}\nDRILL CURRICULUM COMPLETE\n"
+                f"{'=' * 54}\nAll skill drills passed.\n\n"
+                "Carrying learned weights into the Project 2 variant curriculum.\n"
+                "Starting Variant 1.\n"
+                f"{'=' * 54}",
+                flush=True,
+            )
+            recent_batches.clear()
+            summary.current_stage = item_by_number[1]
+        elif (
+            batch_phase == "variant"
+            and newest_item == len(variant_items)
+            and newest_wins >= required_wins
+        ):
+            print(
+                f"Newest variant V{newest_item} met its training ratio; "
+                "final frozen evaluation still controls completion.",
+                flush=True,
+            )
         else:
             print(
                 f"Newest {item_prefix.lower()} {newest_item} did not unlock "
@@ -2769,7 +3885,6 @@ def _run_parallel_curriculum(
             and not no_training
             and not stage_unlocked
         ):
-            variant_stagnation_trials += len(episode_items)
             print(
                 f"Variant progress: trials since last progress: "
                 f"{variant_stagnation_trials}/"
@@ -2801,14 +3916,7 @@ def _run_parallel_curriculum(
                 "timed_out_counts": {},
                 "skipped_variants": [],
             }
-        elif _frozen_evaluation_is_due(
-            phase=batch_phase,
-            all_variants_unlocked=len(unlocked_items) == len(variant_items),
-            no_training=no_training,
-            focus_variant=focus_variant,
-            batches_since_evaluation=batches_since_evaluation,
-            focus_batches=focus_batches,
-        ):
+        elif decision.evaluation_due:
             print(
                 "All variants unlocked. Beginning frozen evaluation.",
                 flush=True,
@@ -2834,7 +3942,14 @@ def _run_parallel_curriculum(
                 eval_timeout_seconds,
             )
             evaluation_performed = True
-            last_evaluation_win_rates = dict(evaluation_win_rates)
+            eval_decision = engine.record_evaluation(
+                evaluation_win_rates, complete=final_complete
+            )
+            last_evaluation_win_rates = dict(engine.last_evaluation_win_rates)
+            variant_stagnation_trials = engine.stagnation_trials
+            frozen_progress_detected = (
+                frozen_progress_detected or eval_decision.progress_detected
+            )
             if final_complete:
                 print(
                     f"All variants meet >="
@@ -2842,29 +3957,14 @@ def _run_parallel_curriculum(
                     flush=True,
                 )
             else:
-                focus_for_progress = (
-                    batch_focus_variant
-                    if batch_focus_variant is not None
-                    else focus_variant
-                )
                 if not no_training:
                     if not batch_last_evaluation_win_rates:
-                        variant_stagnation_trials = 0
-                        frozen_progress_detected = True
                         print(
                             "Initial all-variant frozen baseline established; "
                             "stagnation counter reset.",
                             flush=True,
                         )
-                    elif _frozen_evaluation_improved(
-                        batch_last_evaluation_win_rates,
-                        evaluation_win_rates,
-                        eval_trials,
-                        focus_for_progress,
-                        tuple(range(1, len(variant_items) + 1)),
-                    ):
-                        variant_stagnation_trials = 0
-                        frozen_progress_detected = True
+                    elif eval_decision.improved:
                         print(
                             "Frozen progress detected in passing count, "
                             "bottleneck, or focused variant; stagnation counter reset.",
@@ -2876,10 +3976,8 @@ def _run_parallel_curriculum(
                             f"remains {variant_stagnation_trials} trials.",
                             flush=True,
                         )
-                previous_focus = focus_variant
-                focus_variant = _select_weakest_variant(
-                    evaluation_win_rates, tuple(range(1, len(variant_items) + 1))
-                )
+                previous_focus = eval_decision.previous_focus
+                focus_variant = eval_decision.focus_variant
                 if previous_focus != focus_variant:
                     _append_history_record(
                         history_path,
@@ -2898,7 +3996,7 @@ def _run_parallel_curriculum(
                 _print_focus_selection(
                     evaluation_win_rates, focus_variant, focus_batches
                 )
-                batches_since_evaluation = 0
+                batches_since_evaluation = engine.batches_since_evaluation
         else:
             evaluation_win_rates = dict(last_evaluation_win_rates)
             final_complete = False
@@ -2997,18 +4095,9 @@ def _run_parallel_curriculum(
         )
         # Refresh only after variant stagnation; drills do not advance the
         # variant batch counter or alter the saved focus/evaluation state.
-        refresh_due = _drill_refresh_is_due(
-            curriculum=curriculum,
-            no_training=no_training,
-            phase=batch_phase,
-            stagnation_trials=variant_stagnation_trials,
-            refresh_after=drill_refresh_after,
-            final_complete=final_complete,
-            all_variants_unlocked=len(unlocked_items) == len(variant_items),
-            evaluation_performed=evaluation_performed,
-        )
+        refresh_due = engine.refresh_due(evaluation_performed=evaluation_performed)
         if refresh_due:
-            refresh_number = drill_refresh_count + 1
+            refresh_number = engine.drill_refresh_count + 1
             refresh_reason = (
                 "stage progression did not advance"
                 if len(unlocked_items) < len(variant_items)
@@ -3088,7 +4177,8 @@ def _run_parallel_curriculum(
                 history_path=history_path,
                 worker_details=worker_details,
             )
-            drill_refresh_count = refresh_number
+            engine.refresh_completed()
+            drill_refresh_count = engine.drill_refresh_count
             _append_history_record(
                 history_path,
                 {
@@ -3385,6 +4475,8 @@ def _run_parallel_progressive_training(
 
 def _validate_training_options(options: TrainingOptions) -> TrainingOptions:
     """Validate run settings and resolve the display/GUIs defaults."""
+    if options.agent_type not in {"q", "dqn"}:
+        raise ValueError("--agent must be q or dqn")
     if options.trials < 1:
         raise ValueError("trials must be at least 1")
     if not 1 <= options.survive <= options.trials:
@@ -3419,13 +4511,42 @@ def _validate_training_options(options: TrainingOptions) -> TrainingOptions:
         raise ValueError("--eval-timeout-seconds must be positive and finite")
     if options.no_training and options.fresh:
         raise ValueError("--fresh cannot be used with --no-training")
-    weights_path = Path(options.weights_path)
+    weights_path = Path(
+        options.weights_path
+        if options.weights_path is not None
+        else (
+            DEFAULT_WEIGHTS_PATH
+            if options.agent_type == "q"
+            else DEFAULT_DQN_CHECKPOINT_PATH
+        )
+    )
     if options.no_training and not weights_path.is_file():
         raise FileNotFoundError(
             f"Frozen evaluation requires an existing compatible weights file: {weights_path}"
         )
     if options.workers < 1:
         raise ValueError("--workers must be at least 1")
+    if options.dqn_updates_per_batch < 0:
+        raise ValueError("--dqn-updates-per-batch must be at least 0")
+    if options.start_variant is not None:
+        if options.agent_type != "dqn":
+            raise ValueError("--start-variant is only supported with --agent dqn")
+        if not 1 <= options.start_variant <= len(progression()):
+            raise ValueError(
+                f"--start-variant must be between 1 and {len(progression())}"
+            )
+    if options.agent_type != "dqn" and (
+        options.dqn_learning_rate is not None or options.dqn_epsilon is not None
+    ):
+        raise ValueError("--dqn-learning-rate/--dqn-epsilon require --agent dqn")
+    if options.dqn_learning_rate is not None and not (
+        math.isfinite(options.dqn_learning_rate) and options.dqn_learning_rate > 0
+    ):
+        raise ValueError("--dqn-learning-rate must be positive and finite")
+    if options.dqn_epsilon is not None and not (
+        math.isfinite(options.dqn_epsilon) and 0.0 <= options.dqn_epsilon <= 1.0
+    ):
+        raise ValueError("--dqn-epsilon must be between 0 and 1")
     guis = options.guis
     if guis is None:
         guis = 1 if options.display else 0
@@ -3447,7 +4568,7 @@ def run_progressive_training(
     trials: int = DEFAULT_TRIALS,
     survive: int = DEFAULT_SURVIVE,
     seed: int = DEFAULT_SEED,
-    weights_path: Path = DEFAULT_WEIGHTS_PATH,
+    weights_path: Optional[Path] = None,
     display: bool = DEFAULT_DISPLAY,
     fresh: bool = False,
     max_batches: Optional[int] = None,
@@ -3470,6 +4591,11 @@ def run_progressive_training(
     agent_factory: Optional[Callable] = None,
     game_factory: Optional[Callable] = None,
     episode_runner: Optional[Callable] = None,
+    agent_type: str = "q",
+    dqn_updates_per_batch: int = DQN_UPDATES_PER_BATCH,
+    start_variant: Optional[int] = None,
+    dqn_learning_rate: Optional[float] = None,
+    dqn_epsilon: Optional[float] = None,
 ) -> TrainingSummary:
     """Run the selected curriculum through parallel or sequential workers.
 
@@ -3503,8 +4629,29 @@ def run_progressive_training(
             agent_factory=agent_factory,
             game_factory=game_factory,
             episode_runner=episode_runner,
+            agent_type=agent_type,
+            dqn_updates_per_batch=dqn_updates_per_batch,
+            start_variant=start_variant,
+            dqn_learning_rate=dqn_learning_rate,
+            dqn_epsilon=dqn_epsilon,
         )
     )
+
+    if options.agent_type == "dqn" and options.workers > 1:
+        if any(
+            factory is not None
+            for factory in (
+                options.agent_factory,
+                options.game_factory,
+                options.episode_runner,
+            )
+        ):
+            raise ValueError(
+                "Custom agent, game, and episode factories are only supported "
+                "for DQN with --workers 1."
+            )
+    if options.agent_type == "dqn":
+        return _run_sequential_progressive_training(options)
 
     if options.workers > 1:
         if any(
@@ -3554,11 +4701,12 @@ def _run_sequential_progressive_training(
     agent_factory = options.agent_factory
     game_factory = options.game_factory
     episode_runner = options.episode_runner
+    agent_type = options.agent_type
+    dqn_updates_per_batch = options.dqn_updates_per_batch
 
     _configure_runtime(display)
     if curriculum == "drills":
         validate_drill_maps()
-    agent_factory = agent_factory or _create_qagent
     game_factory = game_factory or _build_variant_game
     episode_runner = episode_runner or partial(
         _run_episode,
@@ -3567,19 +4715,53 @@ def _run_sequential_progressive_training(
     weights_path = Path(weights_path)
     variant_items = progression()
     drill_items = drill_progression()
-    weights, save_agent, can_save = _load_initial_weights(
-        weights_path,
-        fresh,
-        agent_factory,
-    )
-    last_valid_weights = dict(weights)
+    if agent_type == "q":
+        agent_factory = agent_factory or _create_qagent
+        weights, save_agent, can_save = _load_initial_weights(
+            weights_path,
+            fresh,
+            agent_factory,
+        )
+        last_valid_weights = dict(weights)
+        dqn_agent = None
+    else:
+        from team01.agent.deep_q_learning import checkpoint_snapshots_equal
+
+        agent_factory = agent_factory or _create_dqn_agent
+        dqn_agent, can_save = _load_dqn_training_state(
+            weights_path,
+            fresh,
+            agent_factory,
+            options.dqn_learning_rate,
+            options.dqn_epsilon,
+        )
+        weights = None
+        save_agent = dqn_agent
+        last_valid_weights = {}
+
+        def agent_factory():
+            dqn_agent.x = 0
+            dqn_agent.y = 0
+            return dqn_agent
+
     summary = TrainingSummary()
-    phase = "drill" if curriculum == "drills" else "variant"
-    active_items = drill_items if phase == "drill" else variant_items
-    item_by_number = {item.number: item for item in active_items}
-    unlocked_items = [1]
-    phase_batch = 0
-    phase_seed = seed ^ DRILL_SEED_OFFSET if phase == "drill" else seed
+    engine = CurriculumEngine(
+        trials=trials,
+        survive=survive,
+        seed=seed,
+        eval_trials=eval_trials,
+        curriculum=curriculum,
+        focus_batches=focus_batches,
+        drill_refresh_after=drill_refresh_after,
+        no_training=no_training,
+        start_variant=options.start_variant,
+    )
+    summary.decision_trace = engine.trace
+    phase = engine.phase
+    active_items, item_by_number = _curriculum_items(phase)
+    unlocked_items = engine.unlocked_items
+    phase_batch = engine.phase_batch
+    phase_seed = engine.phase_seed
     seed_rng = random.Random(phase_seed)
     recent_batches = deque(maxlen=STALE_WINDOW)
     round_counter = 0
@@ -3594,6 +4776,7 @@ def _run_sequential_progressive_training(
             {
                 "record_type": "run_start",
                 "seed": seed,
+                "agent": agent_type,
                 "workers": workers,
                 "trials_per_batch": trials,
                 "eval_trials_per_variant": eval_trials,
@@ -3612,7 +4795,13 @@ def _run_sequential_progressive_training(
     active_agent = None
 
     try:
-        print("Project 2 Progressive Q-Learning Training", flush=True)
+        print(
+            "Project 2 Progressive "
+            f"{'Q-Learning' if agent_type == 'q' else 'DQN'} Training",
+            flush=True,
+        )
+        if agent_type == "dqn":
+            print("Agent: dqn", flush=True)
         print(f"Map: {DEFAULT_MAP_PATH}", flush=True)
         print(f"Trials per batch: {trials}", flush=True)
         print(f"Successes required: {survive}", flush=True)
@@ -3633,11 +4822,17 @@ def _run_sequential_progressive_training(
             else "Learning: Enabled",
             flush=True,
         )
-        print(
-            f"Q contribution diagnostic: "
-            f"{'Enabled' if q_contributions_diagnostic else 'Disabled'}",
-            flush=True,
-        )
+        if agent_type == "q":
+            print(
+                f"Q contribution diagnostic: "
+                f"{'Enabled' if q_contributions_diagnostic else 'Disabled'}",
+                flush=True,
+            )
+        else:
+            print(
+                f"Maximum DQN updates per batch: {dqn_updates_per_batch}",
+                flush=True,
+            )
 
         while not summary.completed:
             if max_batches is not None and summary.completed_batches >= max_batches:
@@ -3645,19 +4840,15 @@ def _run_sequential_progressive_training(
                 break
 
             batch_number = summary.completed_batches + 1
-            phase_batch += 1
             summary.current_batch = batch_number
-            batch_phase = phase
+            batch_plan = engine.plan_batch()
+            phase_batch = engine.phase_batch
+            batch_phase = engine.batch_phase
             batch_unlocked_items = tuple(unlocked_items)
             newest_item = unlocked_items[-1]
             summary.current_stage = item_by_number[newest_item]
-            post_unlock_phase = (
-                phase == "variant" and len(unlocked_items) == len(variant_items)
-            )
-            batch_last_evaluation_win_rates = dict(last_evaluation_win_rates)
-            batch_focus_variant = (
-                focus_variant if post_unlock_phase and not no_training else None
-            )
+            batch_last_evaluation_win_rates = engine.batch_last_evaluation_win_rates
+            batch_focus_variant = engine.batch_focus_variant
             focus_batch_index = (
                 batches_since_evaluation + 1 if batch_focus_variant is not None else None
             )
@@ -3665,14 +4856,6 @@ def _run_sequential_progressive_training(
                 "weakest_variant_focus"
                 if batch_focus_variant is not None
                 else ("read_only" if no_training else f"progressive_{phase}")
-            )
-            batch_plan = _plan_training_batch(
-                trials,
-                survive,
-                unlocked_items,
-                phase_seed,
-                phase_batch,
-                focus_variant=batch_focus_variant,
             )
             episode_items = batch_plan.episode_items
             distribution = batch_plan.distribution
@@ -3731,80 +4914,237 @@ def _run_sequential_progressive_training(
 
             batch_results: list[tuple[int, object]] = []
             batch_round_metrics = []
+            dqn_episode_results = []
+            dqn_batch_metrics = None
             batch_stopped = False
+            parallel_dqn_assignments = None
+            parallel_dqn_results = None
+
+            if agent_type == "dqn" and workers > 1 and not no_training:
+                parallel_dqn_assignments = tuple(
+                    (
+                        item_by_number[item_number],
+                        seed_rng.randint(0, 2**32 - 1),
+                    )
+                    for item_number in episode_items
+                )
+                parallel_dqn_results = _run_dqn_rollout_batch(
+                    agent=dqn_agent,
+                    assignments=parallel_dqn_assignments,
+                    workers=workers,
+                    guis=guis,
+                    batch_number=batch_number,
+                    epsilon=dqn_agent.epsilon,
+                    worker_details=worker_details,
+                )
+                valid_counts, missing_items = _dqn_rollout_coverage(
+                    episode_items,
+                    parallel_dqn_results,
+                )
+                failed_results = [
+                    result
+                    for result in parallel_dqn_results
+                    if not _dqn_result_is_numerically_stable(result)
+                ]
+                for result in failed_results:
+                    print(
+                        f"WARNING: DQN worker {result.worker_id} trial "
+                        f"{result.trial_index} ({result.challenge_number}) "
+                        f"{result.outcome}: {result.error or 'invalid rollout result'}",
+                        flush=True,
+                    )
+                if missing_items:
+                    labels = ", ".join(f"{item_prefix[0]}{item}" for item in missing_items)
+                    summary.stopped_reason = (
+                        "DQN rollout batch had no valid result for assigned "
+                        f"curriculum item(s): {labels}; no replay updates or "
+                        "checkpoint save performed"
+                    )
+                    print(f"STOP: {summary.stopped_reason}", flush=True)
+                    batch_stopped = True
+                    _append_history_record(
+                        history_path,
+                        {
+                            "record_type": "dqn_rollout_failure",
+                            "agent": "dqn",
+                            "batch": batch_number,
+                            "worker_limit": min(workers, len(parallel_dqn_results)),
+                            "episodes_assigned": len(parallel_dqn_results),
+                            "episodes_valid": len(parallel_dqn_results)
+                            - len(failed_results),
+                            "episode_errors": len(failed_results),
+                            "missing_curriculum_items": list(missing_items),
+                        },
+                    )
+                if missing_items:
+                    print(
+                        f"Parallel DQN rollout: "
+                        f"{len(parallel_dqn_results) - len(failed_results)}/"
+                        f"{len(parallel_dqn_results)} episodes valid | "
+                        f"Worker limit: {min(workers, len(parallel_dqn_results))} | "
+                        f"Episode errors: {len(failed_results)}",
+                        flush=True,
+                    )
 
             for trial_number, item_number in enumerate(episode_items, start=1):
+                if batch_stopped:
+                    break
                 round_counter += 1
                 challenge = item_by_number[item_number]
                 summary.current_stage = challenge
-                round_start_weights = dict(weights)
+                round_start_weights = dict(weights) if weights is not None else None
                 label = (
                     f"Stage {challenge.number} | Batch {batch_number} | "
                     f"Trial {trial_number}/{trials} | Episode {summary.completed_trials + 1}"
                 )
-                trial_seed = seed_rng.randint(0, 2**32 - 1)
-                game, active_agent = game_factory(
-                    challenge,
-                    trial_seed,
-                    weights,
-                    agent_factory,
+                if parallel_dqn_results is not None:
+                    trial_seed = parallel_dqn_assignments[trial_number - 1][1]
+                    active_agent = dqn_agent
+                    game = None
+                    parallel_result = parallel_dqn_results[trial_number - 1]
+                else:
+                    trial_seed = seed_rng.randint(0, 2**32 - 1)
+                    game, active_agent = game_factory(
+                        challenge,
+                        trial_seed,
+                        weights,
+                        agent_factory,
+                    )
+                    parallel_result = None
+                frozen_dqn_snapshot = (
+                    dqn_agent.get_checkpoint_snapshot()
+                    if agent_type == "dqn" and no_training
+                    else None
                 )
-                active_agent.set_learning(
-                    no_training,
-                    epsilon=active_agent.epsilon,
+                frozen_dqn_replay_size = (
+                    len(dqn_agent.replay_buffer)
+                    if agent_type == "dqn" and no_training
+                    else None
                 )
+                if agent_type == "dqn":
+                    if parallel_result is None:
+                        if no_training:
+                            active_agent.set_learning(no_training=True, epsilon=0.0)
+                        else:
+                            active_agent.set_rollout(
+                                epsilon=active_agent.epsilon,
+                                collect_experience=True,
+                            )
+                else:
+                    active_agent.set_learning(
+                        no_training,
+                        epsilon=active_agent.epsilon,
+                    )
                 active_agent.q_contributions_diagnostic = q_contributions_diagnostic
                 updates_before = getattr(active_agent, "td_update_count", 0)
-                result = episode_runner(
-                    game,
-                    active_agent,
-                    summary.completed_trials + 1,
-                    label,
-                    display,
-                )
-                summary.completed_trials += 1
-                batch_results.append((item_number, result))
-
-                frozen_unchanged = (
-                    not no_training
-                    or (
-                        active_agent.weights == round_start_weights
-                        and getattr(active_agent, "td_update_count", 0) == updates_before
+                result = (
+                    parallel_result
+                    if parallel_result is not None
+                    else episode_runner(
+                        game,
+                        active_agent,
+                        summary.completed_trials + 1,
+                        label,
+                        display,
                     )
                 )
-                stable = (
-                    _result_is_numerically_stable(result, active_agent.weights)
-                    and frozen_unchanged
-                )
-                if stable and not no_training:
-                    weights = active_agent.weights
-                    _save_weights(active_agent, weights, weights_path)
-                    save_agent = active_agent
-                    last_valid_weights = dict(weights)
-                    can_save = True
+                if parallel_result is None:
+                    summary.completed_trials += 1
+                batch_results.append((item_number, result))
+
+                if agent_type == "dqn":
+                    if no_training:
+                        dqn_agent.episodes = frozen_dqn_snapshot["episodes"]
+                    if no_training and (
+                        not checkpoint_snapshots_equal(
+                            frozen_dqn_snapshot, dqn_agent.get_checkpoint_snapshot()
+                        )
+                        or len(dqn_agent.replay_buffer) != frozen_dqn_replay_size
+                    ):
+                        raise RuntimeError(
+                            "Frozen DQN episode mutated training learner state"
+                        )
+                    stable = _dqn_result_is_numerically_stable(result)
+                    if stable and not no_training:
+                        dqn_episode_results.append(result)
+                    if parallel_result is not None and stable:
+                        summary.completed_trials += 1
+                        dqn_agent.episodes += 1
+                else:
+                    frozen_unchanged = (
+                        not no_training
+                        or (
+                            active_agent.weights == round_start_weights
+                            and getattr(active_agent, "td_update_count", 0) == updates_before
+                        )
+                    )
+                    stable = (
+                        _result_is_numerically_stable(result, active_agent.weights)
+                        and frozen_unchanged
+                    )
+                    if stable and not no_training:
+                        weights = active_agent.weights
+                        _save_weights(active_agent, weights, weights_path)
+                        save_agent = active_agent
+                        last_valid_weights = dict(weights)
+                        can_save = True
 
                 if worker_details:
                     print(
                         f"[Trial {summary.completed_trials} | "
+                        f"Worker {getattr(result, 'worker_id', 0)} | "
                         f"{item_prefix} {challenge.number} | "
                         f"Batch {batch_number} {trial_number}/{trials}] "
                         f"Outcome: {result.outcome} | Ticks: {result.ticks} | "
                         f"Reward: {result.total_reward:.0f} | "
                         f"Bombs: {result.bombs_placed} | "
-                        f"Weights saved: "
-                        f"{'no (evaluation mode)' if no_training else ('yes' if stable else 'no (unstable values)')}",
+                        + (
+                            "DQN transitions: "
+                            f"{len(getattr(result, 'transitions', ()))}"
+                            if agent_type == "dqn"
+                            else (
+                                "Weights saved: "
+                                f"{'no (evaluation mode)' if no_training else ('yes' if stable else 'no (unstable values)')}"
+                            )
+                        ),
                         flush=True,
                     )
 
                 if not stable:
+                    if parallel_result is not None:
+                        _append_history_record(
+                            history_path,
+                            {
+                                "record_type": "training_round",
+                                "agent": "dqn",
+                                "batch": batch_number,
+                                "round": round_counter,
+                                **_phase_history_fields(
+                                    batch_phase, batch_unlocked_items, (item_number,)
+                                ),
+                                "training_enabled": True,
+                                "training_mode": training_mode,
+                                "worker_id": result.worker_id,
+                                "trial_index": result.trial_index,
+                                "seed": result.seed,
+                                "outcome": result.outcome,
+                                "error": result.error,
+                            },
+                        )
+                        continue
                     if no_training:
                         summary.stopped_reason = (
-                            "frozen evaluation changed weights, updated TD state, "
-                            "or returned non-finite values"
+                            "frozen DQN evaluation returned non-finite values"
+                            if agent_type == "dqn"
+                            else (
+                                "frozen evaluation changed weights, updated TD state, "
+                                "or returned non-finite values"
+                            )
                         )
                     else:
-                        weights.clear()
-                        weights.update(last_valid_weights)
+                        if weights is not None:
+                            weights.clear()
+                            weights.update(last_valid_weights)
                         summary.stopped_reason = (
                             f"numerical instability in stage {challenge.number}, "
                             f"batch {batch_number}, trial {trial_number}"
@@ -3814,42 +5154,110 @@ def _run_sequential_progressive_training(
                     batch_stopped = True
                     break
 
-                merged_weights = round_start_weights if no_training else dict(active_agent.weights)
-                diagnostics = _weight_update_diagnostics(
-                    round_start_weights,
-                    [dict(active_agent.weights)],
-                    merged_weights,
-                    [(result.mean_abs_td_error, getattr(active_agent, "td_update_count", 0))],
-                    result.max_abs_q,
+                if agent_type == "q":
+                    merged_weights = (
+                        round_start_weights
+                        if no_training
+                        else dict(active_agent.weights)
+                    )
+                    diagnostics = _weight_update_diagnostics(
+                        round_start_weights,
+                        [dict(active_agent.weights)],
+                        merged_weights,
+                        [
+                            (
+                                result.mean_abs_td_error,
+                                getattr(active_agent, "td_update_count", 0),
+                            )
+                        ],
+                        result.max_abs_q,
+                    )
+                    _print_learning_progress(diagnostics)
+                    batch_round_metrics.append(diagnostics)
+                    _append_history_record(
+                        history_path,
+                        {
+                            "record_type": "training_round",
+                            "agent": "q",
+                            "batch": batch_number,
+                            "round": round_counter,
+                            **_phase_history_fields(
+                                batch_phase, batch_unlocked_items, (item_number,)
+                            ),
+                            "training_enabled": not no_training,
+                            "training_mode": training_mode,
+                            "focus_variant": batch_focus_variant,
+                            **diagnostics,
+                            "weights": dict(merged_weights),
+                        },
+                    )
+                else:
+                    _append_history_record(
+                        history_path,
+                        {
+                            "record_type": "training_round",
+                            "agent": "dqn",
+                            "batch": batch_number,
+                            "round": round_counter,
+                            **_phase_history_fields(
+                                batch_phase, batch_unlocked_items, (item_number,)
+                            ),
+                            "training_enabled": not no_training,
+                            "training_mode": training_mode,
+                            "focus_variant": batch_focus_variant,
+                            "outcome": result.outcome,
+                            "ticks": result.ticks,
+                            "total_reward": result.total_reward,
+                            "bombs_placed": result.bombs_placed,
+                            "transitions_collected": len(
+                                getattr(result, "transitions", ())
+                            ),
+                            "max_abs_q": result.max_abs_q,
+                        },
+                    )
+
+            if agent_type == "dqn" and not no_training and not batch_stopped:
+                dqn_agent.set_learning(
+                    no_training=False,
+                    epsilon=dqn_agent.epsilon,
                 )
-                _print_learning_progress(diagnostics)
-                batch_round_metrics.append(diagnostics)
-                _append_history_record(
-                    history_path,
-                    {
-                        "record_type": "training_round",
-                        "batch": batch_number,
-                        "round": round_counter,
-                        **_phase_history_fields(
-                            batch_phase, batch_unlocked_items, (item_number,)
+                dqn_batch_metrics = _consume_dqn_episode_results(
+                    dqn_agent,
+                    dqn_episode_results,
+                    dqn_updates_per_batch,
+                )
+                dqn_batch_metrics.update(
+                    worker_limit=min(
+                        workers,
+                        (
+                            len(parallel_dqn_results)
+                            if parallel_dqn_results is not None
+                            else len(episode_items)
                         ),
-                        "training_enabled": not no_training,
-                        "training_mode": training_mode,
-                        "focus_variant": batch_focus_variant,
-                        **diagnostics,
-                        "weights": dict(merged_weights),
-                    },
+                    ),
+                    episodes_assigned=(
+                        len(parallel_dqn_results)
+                        if parallel_dqn_results is not None
+                        else len(episode_items)
+                    ),
+                    episodes_valid=len(dqn_episode_results),
+                    episode_errors=(
+                        len(parallel_dqn_results) - len(dqn_episode_results)
+                        if parallel_dqn_results is not None
+                        else 0
+                    ),
                 )
+                _print_dqn_batch_summary(dqn_batch_metrics)
+                if len(batch_results) == len(episode_items):
+                    dqn_agent.save_checkpoint(weights_path)
+                    can_save = True
+                    summary.weights_saved = True
 
             if batch_stopped:
                 break
 
             newest_count = distribution.get(newest_item, 0)
             required_wins = batch_plan.required_newest_wins
-            newest_wins = _count_newest_item_wins(
-                batch_results,
-                newest_item,
-            )
             _print_mixed_batch_summary(
                 episode_items,
                 batch_results,
@@ -3862,18 +5270,29 @@ def _run_sequential_progressive_training(
             if batch_focus_variant is not None:
                 _print_focus_variant_results(batch_focus_variant, batch_results)
             summary.completed_batches += 1
-            phase_transitioned = False
-            stage_unlocked = False
+            decision = engine.record_batch(
+                batch_results,
+                trained_episodes=(
+                    len(dqn_episode_results) if agent_type == "dqn" else None
+                ),
+            )
+            phase = engine.phase
+            active_items, item_by_number = _curriculum_items(phase)
+            unlocked_items = engine.unlocked_items
+            phase_batch = engine.phase_batch
+            phase_seed = engine.phase_seed
+            batches_since_evaluation = engine.batches_since_evaluation
+            variant_stagnation_trials = engine.stagnation_trials
+            newest_wins = decision.newest_wins
+            phase_transitioned = decision.phase_transitioned
+            stage_unlocked = decision.stage_unlocked
 
             if batch_focus_variant is not None:
-                batches_since_evaluation += 1
-            elif newest_wins >= required_wins and newest_item < len(active_items):
-                unlocked_items.append(newest_item + 1)
+                pass
+            elif stage_unlocked:
                 summary.stages_passed += 1
                 summary.current_stage = item_by_number[newest_item + 1]
-                stage_unlocked = True
-                if batch_phase == "variant" and not no_training:
-                    variant_stagnation_trials = 0
+                if decision.progress_detected:
                     print(
                         f"Variant progress detected: V{newest_item + 1} unlocked. "
                         "Stagnation counter reset.",
@@ -3885,38 +5304,28 @@ def _run_sequential_progressive_training(
                     f"{item_prefix[0]}{newest_item + 1}.",
                     flush=True,
                 )
-            elif newest_item == len(active_items) and newest_wins >= required_wins:
-                if batch_phase == "drill":
-                    phase_transitioned = True
-                    print(
-                        f"\n{'=' * 54}\nDRILL CURRICULUM COMPLETE\n"
-                        f"{'=' * 54}\nAll skill drills passed.\n\n"
-                        "Carrying learned weights into the Project 2 variant curriculum.\n"
-                        "Starting Variant 1.\n"
-                        f"{'=' * 54}",
-                        flush=True,
-                    )
-                    phase = "variant"
-                    active_items = variant_items
-                    item_by_number = {
-                        item.number: item for item in variant_items
-                    }
-                    unlocked_items = [1]
-                    phase_batch = 0
-                    phase_seed = (
-                        seed ^ DRILL_VARIANT_SEED_OFFSET
-                        if curriculum == "drills"
-                        else seed
-                    )
-                    seed_rng = random.Random(phase_seed)
-                    recent_batches.clear()
-                    summary.current_stage = item_by_number[1]
-                else:
-                    print(
-                        f"Newest variant V{newest_item} met its training ratio; "
-                        "final frozen evaluation still controls completion.",
-                        flush=True,
-                    )
+            elif phase_transitioned:
+                print(
+                    f"\n{'=' * 54}\nDRILL CURRICULUM COMPLETE\n"
+                    f"{'=' * 54}\nAll skill drills passed.\n\n"
+                    "Carrying learned weights into the Project 2 variant curriculum.\n"
+                    "Starting Variant 1.\n"
+                    f"{'=' * 54}",
+                    flush=True,
+                )
+                seed_rng = random.Random(phase_seed)
+                recent_batches.clear()
+                summary.current_stage = item_by_number[1]
+            elif (
+                batch_phase == "variant"
+                and newest_item == len(variant_items)
+                and newest_wins >= required_wins
+            ):
+                print(
+                    f"Newest variant V{newest_item} met its training ratio; "
+                    "final frozen evaluation still controls completion.",
+                    flush=True,
+                )
             else:
                 print(
                     f"Newest {item_prefix.lower()} {newest_item} did not unlock "
@@ -3930,7 +5339,6 @@ def _run_sequential_progressive_training(
                 and not no_training
                 and not stage_unlocked
             ):
-                variant_stagnation_trials += len(episode_items)
                 print(
                     f"Variant progress: trials since last progress: "
                     f"{variant_stagnation_trials}/"
@@ -3961,14 +5369,7 @@ def _run_sequential_progressive_training(
                     "timed_out_counts": {},
                     "skipped_variants": [],
                 }
-            elif _frozen_evaluation_is_due(
-                phase=batch_phase,
-                all_variants_unlocked=len(unlocked_items) == len(variant_items),
-                no_training=no_training,
-                focus_variant=focus_variant,
-                batches_since_evaluation=batches_since_evaluation,
-                focus_batches=focus_batches,
-            ):
+            elif decision.evaluation_due:
                 print(
                     "All variants unlocked. Beginning frozen evaluation.",
                     flush=True,
@@ -3992,8 +5393,23 @@ def _run_sequential_progressive_training(
                     history_path=history_path,
                     eval_timeout_seconds=eval_timeout_seconds,
                     worker_details=worker_details,
+                    frozen_evaluator=(
+                        partial(
+                            _evaluate_dqn_policy,
+                            dqn_agent,
+                            game_factory=game_factory,
+                            episode_runner=episode_runner,
+                            timeout_seconds=eval_timeout_seconds,
+                        )
+                        if agent_type == "dqn" and evaluation_runner is None
+                        else None
+                    ),
                 )
                 evaluation_performed = True
+                eval_decision = engine.record_evaluation(
+                    evaluation_win_rates, complete=final_complete
+                )
+                variant_stagnation_trials = engine.stagnation_trials
                 if final_complete:
                     print(
                         f"All variants meet >="
@@ -4001,26 +5417,13 @@ def _run_sequential_progressive_training(
                         flush=True,
                     )
                 elif not no_training:
-                    focus_for_progress = (
-                        batch_focus_variant
-                        if batch_focus_variant is not None
-                        else focus_variant
-                    )
                     if not batch_last_evaluation_win_rates:
-                        variant_stagnation_trials = 0
                         print(
                             "Initial all-variant frozen baseline established; "
                             "stagnation counter reset.",
                             flush=True,
                         )
-                    elif _frozen_evaluation_improved(
-                        batch_last_evaluation_win_rates,
-                        evaluation_win_rates,
-                        eval_trials,
-                        focus_for_progress,
-                        tuple(range(1, len(variant_items) + 1)),
-                    ):
-                        variant_stagnation_trials = 0
+                    elif eval_decision.improved:
                         print(
                             "Frozen progress detected in passing count, bottleneck, "
                             "or focused variant; stagnation counter reset.",
@@ -4032,12 +5435,10 @@ def _run_sequential_progressive_training(
                             f"remains {variant_stagnation_trials} trials.",
                             flush=True,
                         )
-                last_evaluation_win_rates = dict(evaluation_win_rates)
+                last_evaluation_win_rates = dict(engine.last_evaluation_win_rates)
                 if not final_complete:
-                    previous_focus = focus_variant
-                    focus_variant = _select_weakest_variant(
-                        evaluation_win_rates, tuple(range(1, len(variant_items) + 1))
-                    )
+                    previous_focus = eval_decision.previous_focus
+                    focus_variant = eval_decision.focus_variant
                     if previous_focus != focus_variant:
                         _append_history_record(
                             history_path,
@@ -4056,7 +5457,7 @@ def _run_sequential_progressive_training(
                     _print_focus_selection(
                         evaluation_win_rates, focus_variant, focus_batches
                     )
-                    batches_since_evaluation = 0
+                    batches_since_evaluation = engine.batches_since_evaluation
             else:
                 evaluation_win_rates = dict(last_evaluation_win_rates)
                 final_complete = False
@@ -4069,49 +5470,83 @@ def _run_sequential_progressive_training(
                     f"{batches_since_evaluation}/{focus_batches} complete.",
                     flush=True,
                 )
-            relative_deltas = [
-                item["relative_weight_delta_l2"]
-                for item in batch_round_metrics
-                if item["relative_weight_delta_l2"] is not None
-            ]
-            batch_metrics = {
-                "relative_weight_delta_l2": (
-                    math.fsum(relative_deltas) / len(relative_deltas)
-                    if relative_deltas
-                    else None
-                ),
-                "mean_worker_delta_l2": (
-                    math.fsum(item["mean_worker_delta_l2"] for item in batch_round_metrics)
-                    / max(1, len(batch_round_metrics))
-                ),
-                "mean_abs_td_error": (
-                    math.fsum(item["mean_abs_td_error"] for item in batch_round_metrics)
-                    / max(1, len(batch_round_metrics))
-                ),
-                "canonical_delta_l2": (
-                    math.fsum(item["canonical_delta_l2"] for item in batch_round_metrics)
-                    / max(1, len(batch_round_metrics))
-                ),
-                "update_agreement_ratio": (
-                    math.fsum(item["update_agreement_ratio"] for item in batch_round_metrics)
-                    / max(1, len(batch_round_metrics))
-                ),
-                "evaluation_score": (
-                    math.fsum(evaluation_win_rates.values()) / len(evaluation_win_rates)
-                    if evaluation_win_rates
-                    else None
-                ),
-            }
-            _print_batch_learning_summary(
-                batch_metrics,
-                len(batch_round_metrics),
-                len(batch_round_metrics),
-                "none" if no_training else "sequential",
+            evaluation_score = (
+                math.fsum(evaluation_win_rates.values()) / len(evaluation_win_rates)
+                if evaluation_win_rates
+                else None
             )
+            if agent_type == "q":
+                relative_deltas = [
+                    item["relative_weight_delta_l2"]
+                    for item in batch_round_metrics
+                    if item["relative_weight_delta_l2"] is not None
+                ]
+                batch_metrics = {
+                    "relative_weight_delta_l2": (
+                        math.fsum(relative_deltas) / len(relative_deltas)
+                        if relative_deltas
+                        else None
+                    ),
+                    "mean_worker_delta_l2": (
+                        math.fsum(
+                            item["mean_worker_delta_l2"]
+                            for item in batch_round_metrics
+                        )
+                        / max(1, len(batch_round_metrics))
+                    ),
+                    "mean_abs_td_error": (
+                        math.fsum(
+                            item["mean_abs_td_error"]
+                            for item in batch_round_metrics
+                        )
+                        / max(1, len(batch_round_metrics))
+                    ),
+                    "canonical_delta_l2": (
+                        math.fsum(
+                            item["canonical_delta_l2"]
+                            for item in batch_round_metrics
+                        )
+                        / max(1, len(batch_round_metrics))
+                    ),
+                    "update_agreement_ratio": (
+                        math.fsum(
+                            item["update_agreement_ratio"]
+                            for item in batch_round_metrics
+                        )
+                        / max(1, len(batch_round_metrics))
+                    ),
+                    "evaluation_score": evaluation_score,
+                }
+                _print_batch_learning_summary(
+                    batch_metrics,
+                    len(batch_round_metrics),
+                    len(batch_round_metrics),
+                    "none" if no_training else "sequential",
+                )
+            else:
+                batch_metrics = {
+                    "relative_weight_delta_l2": None,
+                    "mean_worker_delta_l2": None,
+                    "mean_abs_td_error": (
+                        dqn_batch_metrics["mean_abs_td_error"]
+                        if dqn_batch_metrics is not None
+                        else None
+                    ),
+                    "canonical_delta_l2": None,
+                    "update_agreement_ratio": None,
+                    "evaluation_score": evaluation_score,
+                    **(dqn_batch_metrics or {}),
+                }
             _append_history_record(
                 history_path,
                 {
                     "record_type": "training_batch",
+                    "agent": agent_type,
+                    "worker_limit": (
+                        dqn_batch_metrics["worker_limit"]
+                        if dqn_batch_metrics is not None
+                        else workers
+                    ),
                     "batch": batch_number,
                     "merge_strategy": "sequential",
                     "training_mode": training_mode,
@@ -4154,18 +5589,11 @@ def _run_sequential_progressive_training(
                     **batch_metrics,
                 },
             )
-            refresh_due = _drill_refresh_is_due(
-                curriculum=curriculum,
-                no_training=no_training,
-                phase=batch_phase,
-                stagnation_trials=variant_stagnation_trials,
-                refresh_after=drill_refresh_after,
-                final_complete=final_complete,
-                all_variants_unlocked=len(unlocked_items) == len(variant_items),
-                evaluation_performed=evaluation_performed,
+            refresh_due = engine.refresh_due(
+                evaluation_performed=evaluation_performed
             )
             if refresh_due:
-                refresh_number = drill_refresh_count + 1
+                refresh_number = engine.drill_refresh_count + 1
                 # Keep unlock and focus progress while refreshing the drill skills.
                 saved_variant_state = VariantResumeState(
                     unlocked_variants=tuple(unlocked_items),
@@ -4239,12 +5667,22 @@ def _run_sequential_progressive_training(
                         no_training=no_training,
                         history_path=history_path,
                         worker_details=worker_details,
+                        agent_type=agent_type,
+                        dqn_updates_per_batch=dqn_updates_per_batch,
+                        workers=workers,
+                        guis=guis,
                     )
                 )
-                last_valid_weights = dict(weights)
+                refresh_failed = any(
+                    result.get("batch_rejected", False)
+                    for result in drill_results.values()
+                )
+                if weights is not None:
+                    last_valid_weights = dict(weights)
                 can_save = can_save or summary.weights_saved
                 active_agent = None
-                drill_refresh_count = refresh_number
+                engine.refresh_completed()
+                drill_refresh_count = engine.drill_refresh_count
                 _append_history_record(
                     history_path,
                     {
@@ -4291,6 +5729,8 @@ def _run_sequential_progressive_training(
                     "Variant stagnation counter reset to 0.",
                     flush=True,
                 )
+                if refresh_failed:
+                    break
             if not no_training and evaluation_performed:
                 _maybe_warn_stale_policy(
                     batch_metrics,
@@ -4348,7 +5788,11 @@ def _run_sequential_progressive_training(
         summary.stopped_reason = str(error)
         print(f"Training stopped: {error}", flush=True)
     finally:
-        if active_agent is not None and not no_training:
+        if (
+            agent_type == "q"
+            and active_agent is not None
+            and not no_training
+        ):
             active_weights = active_agent.weights
             active_updates = getattr(active_agent, "td_update_count", 0)
             if _weights_are_finite(active_weights) and (
@@ -4359,20 +5803,40 @@ def _run_sequential_progressive_training(
 
         if no_training:
             print(
-                "Evaluation mode: weights were not modified or saved. "
-                f"Loaded checkpoint remains at: {weights_path}",
+                (
+                    "Evaluation mode: weights were not modified or saved. "
+                    if agent_type == "q"
+                    else "Evaluation mode: training state was not modified or saved. "
+                )
+                + f"Loaded checkpoint remains at: {weights_path}",
                 flush=True,
             )
-        elif can_save:
-            if not _weights_are_finite(weights):
-                weights.clear()
-                weights.update(last_valid_weights)
-            _save_weights(save_agent, weights, weights_path)
+        elif can_save and not (
+            agent_type == "dqn" and dqn_agent._central_update_in_progress
+        ):
+            if agent_type == "dqn":
+                dqn_agent.save_checkpoint(weights_path)
+            elif agent_type == "dqn" and dqn_agent._central_update_in_progress:
+                print(
+                    "DQN update was interrupted before a stable checkpoint boundary; "
+                    f"the previous checkpoint was left unchanged at: {weights_path}",
+                    flush=True,
+                )
+            else:
+                if not _weights_are_finite(weights):
+                    weights.clear()
+                    weights.update(last_valid_weights)
+                _save_weights(save_agent, weights, weights_path)
             summary.weights_saved = True
-            print(f"Current learned weights saved to: {weights_path}", flush=True)
+            print(
+                f"Current learned "
+                f"{'DQN checkpoint' if agent_type == 'dqn' else 'weights'} "
+                f"saved to: {weights_path}",
+                flush=True,
+            )
         else:
             print(
-                "No trained checkpoint was produced; existing weights were left "
+                "No trained checkpoint was produced; existing training state was left "
                 f"unchanged at: {weights_path}",
                 flush=True,
             )
@@ -4388,8 +5852,14 @@ def _run_sequential_progressive_training(
             )
         if no_training:
             print(f"Evaluation interrupted; loaded checkpoint unchanged at: {weights_path}", flush=True)
-        else:
+        elif agent_type == "q":
             print(f"Current weights saved to: {weights_path if summary.weights_saved else 'not saved'}", flush=True)
+        else:
+            print(
+                f"Current checkpoint saved to: "
+                f"{weights_path if summary.weights_saved else 'not saved'}",
+                flush=True,
+            )
     elif summary.completed:
         print("\nPROGRESSIVE TRAINING COMPLETE", flush=True)
         print("All existing challenge levels passed.", flush=True)
@@ -4397,15 +5867,23 @@ def _run_sequential_progressive_training(
         print(f"Total training episodes: {summary.completed_trials}", flush=True)
         if no_training:
             print(f"Evaluation complete; checkpoint unchanged at: {weights_path}", flush=True)
-        else:
+        elif agent_type == "q":
             print(f"Final weights saved to: {weights_path}", flush=True)
+        else:
+            print(f"Final checkpoint saved to: {weights_path}", flush=True)
     elif summary.stopped_reason is not None:
         print(f"Training stopped: {summary.stopped_reason}", flush=True)
         print(f"Completed trials: {summary.completed_trials}", flush=True)
-        print(
-            f"Weights: {weights_path if summary.weights_saved else 'not saved'}",
-            flush=True,
-        )
+        if agent_type == "q":
+            print(
+                f"Weights: {weights_path if summary.weights_saved else 'not saved'}",
+                flush=True,
+            )
+        else:
+            print(
+                f"Checkpoint: {weights_path if summary.weights_saved else 'not saved'}",
+                flush=True,
+            )
 
     return summary
 
@@ -4416,11 +5894,55 @@ def _run_sequential_progressive_training(
 def parse_args(argv=None):
     """Parse and validate the training command-line options."""
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--agent",
+        dest="agent_type",
+        choices=("q", "dqn"),
+        default="q",
+        help="Training backend (Q-learning remains the default).",
+    )
     parser.add_argument("--trials", type=int, default=DEFAULT_TRIALS, help="Total number of training trials to run.")
     parser.add_argument("--survive", type=int, default=DEFAULT_SURVIVE, help="Number of top-performing trials to retain after each round.")
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED, help="Random seed for reproducibility.")
-    parser.add_argument("--weights", type=Path, default=DEFAULT_WEIGHTS_PATH, help="Path to the weights file.")
-    parser.add_argument("--workers", type=int, default=1, help="Number of parallel worker processes.")
+    parser.add_argument(
+        "--weights",
+        type=Path,
+        default=None,
+        help="Checkpoint path (Q JSON weights or DQN .pt checkpoint).",
+    )
+    parser.add_argument(
+        "--dqn-updates-per-batch",
+        type=int,
+        default=DQN_UPDATES_PER_BATCH,
+        help="Maximum central DQN optimizer updates after each completed rollout batch.",
+    )
+    parser.add_argument(
+        "--start-variant",
+        type=int,
+        default=None,
+        help=(
+            "DQN only: begin in the variant phase with V1..N already unlocked "
+            "(e.g. 4 resumes at V4). Does not mark N passed."
+        ),
+    )
+    parser.add_argument(
+        "--dqn-learning-rate",
+        type=float,
+        default=None,
+        help="DQN only: override the Adam learning rate after loading the checkpoint.",
+    )
+    parser.add_argument(
+        "--dqn-epsilon",
+        type=float,
+        default=None,
+        help="DQN only: override the training exploration epsilon.",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Maximum concurrent rollout worker processes; does not set episode count.",
+    )
     parser.add_argument("--guis", type=int, help="Number of GUI instances to launch for visualization.")
     parser.add_argument("--eval-trials", type=int, default=DEFAULT_EVAL_TRIALS, help="Number of evaluation trials per variant.")
     parser.add_argument(
@@ -4488,8 +6010,16 @@ def parse_args(argv=None):
     parser.set_defaults(display=None)
     args = parser.parse_args(argv)
 
+    if args.weights is None:
+        args.weights = (
+            DEFAULT_WEIGHTS_PATH
+            if args.agent_type == "q"
+            else DEFAULT_DQN_CHECKPOINT_PATH
+        )
     if args.workers < 1:
         parser.error("--workers must be at least 1")
+    if args.dqn_updates_per_batch < 0:
+        parser.error("--dqn-updates-per-batch must be at least 0")
     if args.eval_trials < 1:
         parser.error("--eval-trials must be at least 1")
     if args.eval_timeout_seconds <= 0 or not math.isfinite(args.eval_timeout_seconds):
@@ -4544,6 +6074,11 @@ def main(argv=None) -> TrainingSummary:
         drill_refresh_after=args.drill_refresh_after,
         drill_refresh_trials=args.drill_refresh_trials,
         worker_details=args.worker_details,
+        agent_type=args.agent_type,
+        dqn_updates_per_batch=args.dqn_updates_per_batch,
+        start_variant=args.start_variant,
+        dqn_learning_rate=args.dqn_learning_rate,
+        dqn_epsilon=args.dqn_epsilon,
     )
 
 
