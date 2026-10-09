@@ -7,30 +7,47 @@ import json
 from Bomberman.entity import CharacterEntity
 from Bomberman.events import Event
 from Bomberman.sensed_world import SensedWorld
+from team01.agent.black_board import BlackBoard
+from team01.agent.blackboard_keys import BBKeys
+from team01.agent.controller import QLearningRootController
 
 from .actions import AgentAction
 from .evaluation import (
     Q_FEATURE_VERSION,
     evaluate_q_features,
     prepare_q_feature_context,
+    profiles_from_mapping,
     q_feature_names,
 )
-from .safety import legal_candidate_actions, monster_threat_cells
+from .safety import find_executable_exit_action, legal_candidate_actions, monster_immediate_reachable_cells, monster_threat_cells, assess_immediate_safety
 from .world_model import WorldModel
 
 class QAgent(CharacterEntity):
     # rewards
-    R_WIN = 1000.0
-    R_LOSE = -1000.0
+    R_WIN = 2000.0
+    R_LOSE = -2000.0
     R_COST_OF_LIVING = -0.1
-    R_NEAR_MONSTER = 0.0
+    R_ESCAPE_MONSTER = 0.0 #25 # NOTE: TESTING
+    R_SAFE_ROUTE = 0.0 #25 # NOTE: TESTING
     R_STEP = 0.0
     R_KILL_MONSTER = 0.0
     R_BREAK_WALL = 0.0
     R_PLACE_BOMB = 0.0
+    
+    # class QCandidate(action, features, ):
+    #     action: AgentAction
+    #     features: Dict[str, float]
+    #     eligible: bool
+    #     rejection_reason: str
 
-    def __init__(self, name, avatar, x, y, alpha: float = 0.0005, gamma: float = 0.9, epsilon: float = 0.05):
+    def __init__(self, name, avatar, x, y, alpha: float = 0.0001, gamma: float = 0.9, epsilon: float = 0.05):
         super().__init__(name, avatar, x, y)
+        
+        ## behavior tree
+        self.blackboard = BlackBoard()
+        self.evaluation_profiles = profiles_from_mapping(None) ## NOTE: originally on bomberman agent. needed?
+        self.root = QLearningRootController(self.blackboard, self.evaluation_profiles)
+        ## -------------
         
         self.alpha = alpha
         self.gamma = gamma
@@ -67,15 +84,56 @@ class QAgent(CharacterEntity):
 
     def do(self, wrld: SensedWorld):
         current_model = WorldModel.from_sensed_world(wrld)
-        actions = legal_candidate_actions(current_model)
+        
+        # NOTE:
+        # basic approach to q-learning:
+        #   Pick an initial state, s, at random
+        #   while not at goal state do:
+        #       pick an action a at random
+        #       get s' and r
+        #       update Q(s, a) using (r + gamma*max(a')[Q(s', a')])
+        #   end while
+        
+        # update with behavior tree:
+        #   - QAgent owns action selection & learning
+        #   - behavior tree decides the context and allowed actions for each state
+        
+        # The Q-learning loop is better thought of as: 
+        #   observe state (s), choose an action (a), observe reward (r) and next state (s'), 
+        #   then update (Q(s,a)) using the best allowed action in (s').
+        
+        #   the state isn’t picked randomly each turn; in your agent, the world observation supplies it.
+        
+        # Update action set selection using tree ==============
+        legal_actions = legal_candidate_actions(current_model)
+        
+        legal_actions_features = [self.features(wrld, action) for action in legal_actions]
+        
+        self.blackboard.erase() #sets all keys values to None
+
+        self.blackboard.set(BBKeys.WORLD_MODEL, current_model)
+        self.blackboard.set(BBKeys.SENSED_WORLD, wrld)
+        self.blackboard.set(BBKeys.POSSIBLE_ACTIONS, legal_actions)
+        self.blackboard.set(BBKeys.POSSIBLE_ACTIONS_FEATURES, legal_actions_features)
+        self.root.tick()
+        
+        candidate_actions = {
+            action
+            for action, features in self.blackboard.get(BBKeys.Q_CANDIDATES).items()
+            }
+        
+        candidates = self.blackboard.get(BBKeys.Q_CANDIDATES)
+        
+        # ==============
+        
         me = wrld.me(self)
         bomb_action = AgentAction(0, 0, True)
         can_place_bomb = me is not None and not any(
             bomb.owner == me for bomb in wrld.bombs.values()
         )
-        actions = [action for action in actions if not action.place_bomb or can_place_bomb]
-        if can_place_bomb and bomb_action not in actions:
-            actions.append(bomb_action)
+        actions = [action for action in candidate_actions if not action.place_bomb or can_place_bomb]
+        # if can_place_bomb and bomb_action not in actions: ## NOTE: no randomly adding bombs now
+        #     legal_actions.append(bomb_action)
 
         transition_debug = None
         if (
@@ -86,7 +144,7 @@ class QAgent(CharacterEntity):
         ):
             reward = self.calc_reward(self.prev_model, current_model, self.prev_action)
             next_max_q, _ = self.max_q_value(wrld, actions)
-            previous_q = self.get_q_value(self.prev_features)
+            previous_q = self.get_q_value(self.prev_features) # NOTE: could prob speed up by saving prev_q value
             target = reward + self.gamma * next_max_q
             td_error = self.update(self.prev_features, reward, next_max_q)
             self._record_learning_diagnostics(self.prev_features, td_error)
@@ -97,7 +155,7 @@ class QAgent(CharacterEntity):
         if action is None:
             return
 
-        features = self.features(wrld, action)
+        features = candidates[action]# self.features(wrld, action)
 
         self.prev_model = current_model
         self.prev_action = action
@@ -157,12 +215,14 @@ class QAgent(CharacterEntity):
 
 
     def choose_action(self, wrld: SensedWorld, actions: List[AgentAction]) -> AgentAction:
+        """Choose the best action based on Q-values."""       
         self.last_candidate_q_values = []
         if not actions:
             return None
 
+        # exploration - if random choice is less than epsilon, pick random action
         if self.training and random.random() < self.epsilon:
-            selected_action = random.choice(actions)
+            selected_action = random.choice(actions) # TODO: maybe update with curious exploration function?
             if self.q_contributions_diagnostic:
                 random_state = random.getstate()
                 try:
@@ -182,6 +242,7 @@ class QAgent(CharacterEntity):
                 )
             return selected_action
 
+        # exploitation - otherwise, pick best known action in current state
         best_q, scored_actions = self.max_q_value(wrld, actions)
         self.last_candidate_q_values = scored_actions
         finite_actions = [
@@ -326,12 +387,24 @@ class QAgent(CharacterEntity):
         update_state: bool,
         record_diagnostics: bool,
     ):
+        """Score each candidate action based on its Q-value."""
         if not actions:
             return 0.0, [], []
         scored_actions = []
         details = []
+        # records = [] # list of candidate records, each containing an action & corresponding features
         for action in actions:
             features = self.features(wrld, action)
+            
+            # # Create a record for the current action and its features
+            # action_record = {"action": action, "features": features}
+            # records.append(QCandidate(
+            #     action=action,
+            #     features=features,
+            #     eligible=True,
+            #     rejection_reason=""
+            # ))
+            
             if update_state:
                 q_value = self.get_q_value(features)
                 if self.q_contributions_diagnostic:
@@ -347,6 +420,10 @@ class QAgent(CharacterEntity):
                 else:
                     self.max_abs_q = max(self.max_abs_q, abs(q_value))
             scored_actions.append((action, q_value))
+        
+        # # post the record of each action's feature dict to the blackboard
+        # self.blackboard.set(BBKeys.Q_CANDIDATES, records)
+        
         best_q = max(q for _, q in scored_actions)
         return best_q, scored_actions, details
 
@@ -385,9 +462,32 @@ class QAgent(CharacterEntity):
         reward += self.R_COST_OF_LIVING # minor cost for staying alive
 
         # other costs:
-        if current_position is not None and current_position in monster_threat_cells(current, 2):
-            # within possible chasing distance of monster
-            reward += self.R_NEAR_MONSTER # medium cost for being in danger
+        prev_monster_reach =  monster_immediate_reachable_cells(previous)
+        curr_monster_reach = monster_immediate_reachable_cells(current)
+        future_monster_reach = monster_threat_cells(current)
+
+        def calc_dist_to_monster(pos, monster_pos) -> float:
+            return max(abs(pos[0] - monster_pos[0]), abs(pos[1] - monster_pos[1]))
+        
+        def avg(values) -> float:
+            if not values:
+                return 0.0
+            return sum(values) / len(values)
+
+        curr_monster_dist = min([calc_dist_to_monster(current_position, monster_pos) for monster_pos in curr_monster_reach]) if len(current.monster_positions()) > 0 else 0
+        prev_monster_dist = min([calc_dist_to_monster(previous_position, monster_pos) for monster_pos in prev_monster_reach]) if len(previous.monster_positions()) > 0 else 0
+        d_monster_dist = curr_monster_dist - prev_monster_dist
+        if d_monster_dist < 3:
+            # reward for moving further from monsters
+            reward += self.R_ESCAPE_MONSTER * d_monster_dist
+            if (current_position not in curr_monster_reach and previous_position in prev_monster_reach):
+                mult = 1.0 if current_position not in future_monster_reach else 0.5
+                reward += self.R_ESCAPE_MONSTER * mult ## additional reward for escaping the chase
+        
+        # reward for taking safe routes
+        safe_routes_fraction = self.prev_features.get("safe_successor_fraction")
+        if safe_routes_fraction is not None:
+            reward += self.R_SAFE_ROUTE * safe_routes_fraction
 
         if (
             previous_position is not None
@@ -400,7 +500,7 @@ class QAgent(CharacterEntity):
             if dist_to_exit < prev_dist_to_exit:
                 reward += self.R_STEP # medium reward for getting closer to exit
 
-        # if monster dead, +20
+        # if monster dead
         if len(current.monsters) < len(previous.monsters):
             reward += self.R_KILL_MONSTER # high reward for killing a monster
 

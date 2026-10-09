@@ -19,3 +19,7 @@ class BBKeys:
     DEBUG_INFO = "debug_info"
     EVALUATION_BREAKDOWNS = "evaluation_breakdowns"
     CANDIDATE_SAFETY = "candidate_safety"
+    
+    # q-learning
+    Q_CANDIDATES = "q_candidates"
+    POSSIBLE_ACTIONS_FEATURES = "possible_actions_features"
