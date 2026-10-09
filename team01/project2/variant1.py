@@ -1,24 +1,19 @@
-# This is necessary to find the main code
+"""Standalone runner for Project 2 variant 1."""
+
 import sys
-sys.path.insert(0, '../../bomberman')
-sys.path.insert(1, '..')
+from pathlib import Path
 
-# Import necessary stuff
-from game import Game
-
-# TODO This is your code!
-sys.path.insert(1, '../team01')
-from testcharacter import TestCharacter
+_ROOT = Path(__file__).resolve().parents[2]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
 
 
-# Create the game
-g = Game.fromfile('map.txt')
+from team01.project2.variant_runner import main_for_variant
 
-# TODO Add your character
-g.add_character(TestCharacter("me", # name
-                              "C",  # avatar
-                              0, 0  # position
-))
 
-# Run!
-g.go()
+def main(argv=None):
+    return main_for_variant(1, argv)
+
+
+if __name__ == "__main__":
+    main()

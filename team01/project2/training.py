@@ -1,4 +1,4 @@
-"""Progressively train Project 2 Q-learning or DQN agents."""
+"""Progressively train Project 2 Q, DQN, or QBT agents."""
 
 from __future__ import annotations
 
@@ -18,7 +18,6 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable, Optional
 
-
 # ---------------------------------------------------------------------------
 # Configuration and curriculum definitions
 
@@ -29,10 +28,18 @@ _BOMBERMAN_DIR = _ROOT / "Bomberman"
 if str(_BOMBERMAN_DIR) not in sys.path:
     sys.path.insert(0, str(_BOMBERMAN_DIR))
 
+from team01.project2.agent_backends import (
+    AGENT_CHOICES,
+    AGENT_LABELS,
+    DEFAULT_AGENT,
+    DEFAULT_AGENT_STATE_PATHS,
+    DEFAULT_Q_WEIGHTS_PATH,
+    Q_LEARNING_AGENTS,
+)
+
 DEFAULT_MAP_PATH = Path(__file__).resolve().with_name("map.txt")
 DRILL_MAP_DIRECTORY = Path(__file__).resolve().with_name("drills")
-DEFAULT_WEIGHTS_PATH = Path(__file__).resolve().with_name("q_learning_weights.json")
-DEFAULT_DQN_CHECKPOINT_PATH = Path(__file__).resolve().with_name("dqn_checkpoint.pt")
+DEFAULT_WEIGHTS_PATH = DEFAULT_Q_WEIGHTS_PATH
 DEFAULT_HISTORY_PATH = Path(__file__).resolve().with_name("training_history.jsonl")
 DEFAULT_TRIALS = 10
 DEFAULT_SURVIVE = 5
@@ -147,7 +154,7 @@ class TrainingOptions:
     agent_factory: Optional[Callable]
     game_factory: Optional[Callable]
     episode_runner: Optional[Callable]
-    agent_type: str = "q"
+    agent_type: str = DEFAULT_AGENT
     dqn_updates_per_batch: int = DQN_UPDATES_PER_BATCH
     start_variant: Optional[int] = None
     dqn_learning_rate: Optional[float] = None
@@ -194,6 +201,7 @@ class ParallelTrainingTask:
     evaluation_timeout_seconds: Optional[float] = None
     phase: str = "variant"
     worker_details: bool = False
+    agent_type: str = "q"
 
 
 @dataclass
@@ -401,10 +409,14 @@ def _configure_runtime(display: bool) -> None:
         os.environ["SDL_VIDEODRIVER"] = "dummy"
 
 
-def _qagent_class():
-    from team01.agent.q_learning import QAgent
+def _qagent_class(agent_type: str = "q"):
+    from team01.agent.q_learning import QAgent, QBTAgent
 
-    return QAgent
+    if agent_type == "q":
+        return QAgent
+    if agent_type == "qbt":
+        return QBTAgent
+    raise ValueError(f"unknown Q-learning backend: {agent_type}")
 
 
 def _feature_names() -> tuple[str, ...]:
@@ -420,7 +432,11 @@ def _new_agent():
 
 
 def _create_qagent(**learning_parameters):
-    return _qagent_class()("me", "C", 0, 0, **learning_parameters)
+    return _qagent_class("q")("me", "C", 0, 0, **learning_parameters)
+
+
+def _create_qbt_agent(**learning_parameters):
+    return _qagent_class("qbt")("me", "C", 0, 0, **learning_parameters)
 
 
 def _create_dqn_agent():
@@ -429,8 +445,8 @@ def _create_dqn_agent():
     return DeepQAgent("me", "C", 0, 0)
 
 
-def _default_learning_parameters() -> tuple[float, float, float]:
-    agent = _create_qagent()
+def _default_learning_parameters(agent_type: str = "q") -> tuple[float, float, float]:
+    agent = _qagent_class(agent_type)("me", "C", 0, 0)
     return agent.alpha, agent.gamma, agent.epsilon
 
 
@@ -877,13 +893,22 @@ def _parallel_training_worker(task: ParallelTrainingTask) -> ParallelTrainingRes
                     or task.feature_names != tuple(q_feature_names())
                 ):
                     raise ValueError("Worker feature schema differs from round snapshot")
+                if task.agent_type not in Q_LEARNING_AGENTS:
+                    raise ValueError(
+                        f"unsupported Q-learning worker backend: {task.agent_type}"
+                    )
                 random.seed(task.seed)
+                agent_factory = (
+                    _create_qbt_agent
+                    if task.agent_type == "qbt"
+                    else _create_qagent
+                )
                 game, agent = _build_variant_game(
                     task.challenge,
                     task.seed,
                     dict(task.starting_weights),
                     partial(
-                        _create_qagent,
+                        agent_factory,
                         alpha=task.alpha,
                         gamma=task.gamma,
                         epsilon=task.epsilon,
@@ -1998,11 +2023,12 @@ def _make_round_tasks(
     trial_challenges: Optional[tuple[Challenge | Drill, ...]] = None,
     worker_slots: Optional[int] = None,
     worker_details: bool = False,
+    agent_type: str = "q",
 ) -> tuple[ParallelTrainingTask, ...]:
     from team01.agent.evaluation import Q_FEATURE_VERSION, q_feature_names
 
     if learning_parameters is None:
-        learning_parameters = _default_learning_parameters()
+        learning_parameters = _default_learning_parameters(agent_type)
     alpha, gamma, epsilon = learning_parameters
     feature_names = tuple(q_feature_names())
     tasks = []
@@ -2042,6 +2068,7 @@ def _make_round_tasks(
                 evaluation_timeout_seconds=evaluation_timeout_seconds,
                 phase=phase,
                 worker_details=worker_details,
+                agent_type=agent_type,
             )
         )
     return tuple(tasks)
@@ -2459,6 +2486,7 @@ def _run_parallel_drill_refresh(
     merge_strategy: str,
     history_path: Optional[Path],
     worker_details: bool = False,
+    agent_type: str = "q",
 ) -> tuple[int, dict[int, dict[str, float | int]]]:
     """Replay every drill in parallel and return aggregate results by drill."""
     from team01.agent.evaluation import Q_FEATURE_VERSION, q_feature_names
@@ -2505,6 +2533,7 @@ def _run_parallel_drill_refresh(
                 trial_challenges=(drill,) * len(trial_numbers),
                 worker_slots=workers,
                 worker_details=worker_details,
+                agent_type=agent_type,
             )
             summary.current_round = round_counter
             results = _run_parallel_round(tasks)
@@ -2778,7 +2807,7 @@ def _run_sequential_drill_refresh(
                     epsilon=active_agent.epsilon,
                     collect_experience=True,
                 )
-            elif agent_type == "q":
+            elif agent_type in Q_LEARNING_AGENTS:
                 active_agent.set_learning(False, epsilon=active_agent.epsilon)
             active_agent.q_contributions_diagnostic = q_contributions_diagnostic
             updates_before = getattr(active_agent, "td_update_count", 0)
@@ -2823,7 +2852,7 @@ def _run_sequential_drill_refresh(
                 stable = _result_is_numerically_stable(result, active_agent.weights)
             if parallel_drill_results is None:
                 summary.completed_trials += 1
-            if agent_type == "q":
+            if agent_type in Q_LEARNING_AGENTS:
                 if stable:
                     weights = dict(active_agent.weights)
                     save_agent = active_agent
@@ -2847,7 +2876,7 @@ def _run_sequential_drill_refresh(
                 result, "td_update_count", getattr(active_agent, "td_update_count", 0)
             )
             td_total += td_error
-            if agent_type == "q":
+            if agent_type in Q_LEARNING_AGENTS:
                 diagnostics = _weight_update_diagnostics(
                     start_weights,
                     [dict(active_agent.weights)] if stable else [],
@@ -3120,6 +3149,7 @@ def _evaluate_frozen_policy(
     learning_parameters: tuple[float, float, float],
     eval_timeout_seconds: float,
     worker_details: bool = False,
+    agent_type: str = "q",
 ) -> tuple[dict[int, float], dict[int, int], dict]:
     from team01.agent.evaluation import Q_FEATURE_VERSION, q_feature_names
 
@@ -3146,6 +3176,7 @@ def _evaluate_frozen_policy(
             evaluation_timeout_seconds=eval_timeout_seconds,
             worker_slots=workers,
             worker_details=worker_details,
+            agent_type=agent_type,
         )
         results = []
         variant_timeouts = 0
@@ -3268,6 +3299,7 @@ def _evaluate_batch(
     eval_timeout_seconds: float,
     worker_details: bool = False,
     frozen_evaluator: Optional[Callable] = None,
+    agent_type: str = "q",
 ) -> tuple[dict[int, float], dict[int, int], bool, dict]:
     """Evaluate unlocked variants and return rates, counts, completion, and details."""
     if evaluation_runner is not None:
@@ -3299,6 +3331,7 @@ def _evaluate_batch(
             learning_parameters,
             eval_timeout_seconds,
             worker_details,
+            agent_type,
         )
 
     completed = _print_frozen_evaluation(
@@ -3514,12 +3547,14 @@ def _run_parallel_curriculum(
     drill_refresh_after: int,
     drill_refresh_trials: int,
     worker_details: bool = False,
+    agent_type: str = "q",
+    start_variant: Optional[int] = None,
 ) -> None:
     """Coordinate drill/variant batches, unlocks, evaluation, focus, and refresh."""
     from team01.agent.evaluation import Q_FEATURE_VERSION, q_feature_names
 
     feature_names = tuple(q_feature_names())
-    learning_parameters = _default_learning_parameters()
+    learning_parameters = _default_learning_parameters(agent_type)
     round_counter = 0
     variant_items = progression()
     drill_items = drill_progression()
@@ -3532,6 +3567,7 @@ def _run_parallel_curriculum(
         focus_batches=focus_batches,
         drill_refresh_after=drill_refresh_after,
         no_training=no_training,
+        start_variant=start_variant,
     )
     summary.decision_trace = engine.trace
     phase = engine.phase
@@ -3664,6 +3700,7 @@ def _run_parallel_curriculum(
                 ),
                 worker_slots=workers,
                 worker_details=worker_details,
+                agent_type=agent_type,
             )
             summary.current_round = round_counter
             results = _run_parallel_round(tasks)
@@ -3948,6 +3985,7 @@ def _run_parallel_curriculum(
                 evaluation_runner,
                 history_path,
                 eval_timeout_seconds,
+                agent_type=agent_type,
             )
             evaluation_performed = True
             eval_decision = engine.record_evaluation(
@@ -4184,6 +4222,7 @@ def _run_parallel_curriculum(
                 merge_strategy=merge_strategy,
                 history_path=history_path,
                 worker_details=worker_details,
+                agent_type=agent_type,
             )
             engine.refresh_completed()
             drill_refresh_count = engine.drill_refresh_count
@@ -4319,10 +4358,13 @@ def _run_parallel_progressive_training(
     if curriculum == "drills":
         validate_drill_maps()
     weights_path = Path(weights_path)
+    agent_factory = (
+        _create_qbt_agent if options.agent_type == "qbt" else _create_qagent
+    )
     weights, save_agent, can_save = _load_initial_weights(
         weights_path,
         fresh,
-        _create_qagent,
+        agent_factory,
     )
     checkpoint_state = [can_save]
     weights_state = [weights]
@@ -4353,7 +4395,11 @@ def _run_parallel_progressive_training(
     )
 
     try:
-        print("Project 2 Progressive Q-Learning Training", flush=True)
+        print(
+            f"Project 2 Progressive {AGENT_LABELS[options.agent_type]} Training",
+            flush=True,
+        )
+        print(f"Agent: {options.agent_type}", flush=True)
         print(f"Map: {DEFAULT_MAP_PATH}", flush=True)
         print(f"Trials per batch: {trials}", flush=True)
         print(f"Successes required: {survive}", flush=True)
@@ -4413,6 +4459,8 @@ def _run_parallel_progressive_training(
             drill_refresh_after=drill_refresh_after,
             drill_refresh_trials=drill_refresh_trials,
             worker_details=worker_details,
+            agent_type=options.agent_type,
+            start_variant=options.start_variant,
         )
     except KeyboardInterrupt:
         summary.interrupted = True
@@ -4483,8 +4531,8 @@ def _run_parallel_progressive_training(
 
 def _validate_training_options(options: TrainingOptions) -> TrainingOptions:
     """Validate run settings and resolve the display/GUIs defaults."""
-    if options.agent_type not in {"q", "dqn"}:
-        raise ValueError("--agent must be q or dqn")
+    if options.agent_type not in AGENT_CHOICES:
+        raise ValueError(f"--agent must be one of {', '.join(AGENT_CHOICES)}")
     if options.trials < 1:
         raise ValueError("trials must be at least 1")
     if not 1 <= options.survive <= options.trials:
@@ -4522,11 +4570,7 @@ def _validate_training_options(options: TrainingOptions) -> TrainingOptions:
     weights_path = Path(
         options.weights_path
         if options.weights_path is not None
-        else (
-            DEFAULT_WEIGHTS_PATH
-            if options.agent_type == "q"
-            else DEFAULT_DQN_CHECKPOINT_PATH
-        )
+        else DEFAULT_AGENT_STATE_PATHS[options.agent_type]
     )
     if options.no_training and not weights_path.is_file():
         raise FileNotFoundError(
@@ -4537,8 +4581,6 @@ def _validate_training_options(options: TrainingOptions) -> TrainingOptions:
     if options.dqn_updates_per_batch < 0:
         raise ValueError("--dqn-updates-per-batch must be at least 0")
     if options.start_variant is not None:
-        if options.agent_type != "dqn":
-            raise ValueError("--start-variant is only supported with --agent dqn")
         if not 1 <= options.start_variant <= len(progression()):
             raise ValueError(
                 f"--start-variant must be between 1 and {len(progression())}"
@@ -4599,7 +4641,7 @@ def run_progressive_training(
     agent_factory: Optional[Callable] = None,
     game_factory: Optional[Callable] = None,
     episode_runner: Optional[Callable] = None,
-    agent_type: str = "q",
+    agent_type: str = DEFAULT_AGENT,
     dqn_updates_per_batch: int = DQN_UPDATES_PER_BATCH,
     start_variant: Optional[int] = None,
     dqn_learning_rate: Optional[float] = None,
@@ -4723,8 +4765,10 @@ def _run_sequential_progressive_training(
     weights_path = Path(weights_path)
     variant_items = progression()
     drill_items = drill_progression()
-    if agent_type == "q":
-        agent_factory = agent_factory or _create_qagent
+    if agent_type in Q_LEARNING_AGENTS:
+        agent_factory = agent_factory or (
+            _create_qbt_agent if agent_type == "qbt" else _create_qagent
+        )
         weights, save_agent, can_save = _load_initial_weights(
             weights_path,
             fresh,
@@ -4804,12 +4848,10 @@ def _run_sequential_progressive_training(
 
     try:
         print(
-            "Project 2 Progressive "
-            f"{'Q-Learning' if agent_type == 'q' else 'DQN'} Training",
+            f"Project 2 Progressive {AGENT_LABELS[agent_type]} Training",
             flush=True,
         )
-        if agent_type == "dqn":
-            print("Agent: dqn", flush=True)
+        print(f"Agent: {agent_type}", flush=True)
         print(f"Map: {DEFAULT_MAP_PATH}", flush=True)
         print(f"Trials per batch: {trials}", flush=True)
         print(f"Successes required: {survive}", flush=True)
@@ -4830,7 +4872,7 @@ def _run_sequential_progressive_training(
             else "Learning: Enabled",
             flush=True,
         )
-        if agent_type == "q":
+        if agent_type in Q_LEARNING_AGENTS:
             print(
                 f"Q contribution diagnostic: "
                 f"{'Enabled' if q_contributions_diagnostic else 'Disabled'}",
@@ -5162,7 +5204,7 @@ def _run_sequential_progressive_training(
                     batch_stopped = True
                     break
 
-                if agent_type == "q":
+                if agent_type in Q_LEARNING_AGENTS:
                     merged_weights = (
                         round_start_weights
                         if no_training
@@ -5186,7 +5228,7 @@ def _run_sequential_progressive_training(
                         history_path,
                         {
                             "record_type": "training_round",
-                            "agent": "q",
+                            "agent": agent_type,
                             "batch": batch_number,
                             "round": round_counter,
                             **_phase_history_fields(
@@ -5396,11 +5438,12 @@ def _run_sequential_progressive_training(
                     seed=seed,
                     workers=workers,
                     batch_number=batch_number,
-                    learning_parameters=_default_learning_parameters(),
+                    learning_parameters=_default_learning_parameters(agent_type),
                     evaluation_runner=evaluation_runner,
                     history_path=history_path,
                     eval_timeout_seconds=eval_timeout_seconds,
                     worker_details=worker_details,
+                    agent_type=agent_type,
                     frozen_evaluator=(
                         partial(
                             _evaluate_dqn_policy,
@@ -5483,7 +5526,7 @@ def _run_sequential_progressive_training(
                 if evaluation_win_rates
                 else None
             )
-            if agent_type == "q":
+            if agent_type in Q_LEARNING_AGENTS:
                 relative_deltas = [
                     item["relative_weight_delta_l2"]
                     for item in batch_round_metrics
@@ -5797,7 +5840,7 @@ def _run_sequential_progressive_training(
         print(f"Training stopped: {error}", flush=True)
     finally:
         if (
-            agent_type == "q"
+            agent_type in Q_LEARNING_AGENTS
             and active_agent is not None
             and not no_training
         ):
@@ -5813,7 +5856,7 @@ def _run_sequential_progressive_training(
             print(
                 (
                     "Evaluation mode: weights were not modified or saved. "
-                    if agent_type == "q"
+                    if agent_type in Q_LEARNING_AGENTS
                     else "Evaluation mode: training state was not modified or saved. "
                 )
                 + f"Loaded checkpoint remains at: {weights_path}",
@@ -5860,7 +5903,7 @@ def _run_sequential_progressive_training(
             )
         if no_training:
             print(f"Evaluation interrupted; loaded checkpoint unchanged at: {weights_path}", flush=True)
-        elif agent_type == "q":
+        elif agent_type in Q_LEARNING_AGENTS:
             print(f"Current weights saved to: {weights_path if summary.weights_saved else 'not saved'}", flush=True)
         else:
             print(
@@ -5875,14 +5918,14 @@ def _run_sequential_progressive_training(
         print(f"Total training episodes: {summary.completed_trials}", flush=True)
         if no_training:
             print(f"Evaluation complete; checkpoint unchanged at: {weights_path}", flush=True)
-        elif agent_type == "q":
+        elif agent_type in Q_LEARNING_AGENTS:
             print(f"Final weights saved to: {weights_path}", flush=True)
         else:
             print(f"Final checkpoint saved to: {weights_path}", flush=True)
     elif summary.stopped_reason is not None:
         print(f"Training stopped: {summary.stopped_reason}", flush=True)
         print(f"Completed trials: {summary.completed_trials}", flush=True)
-        if agent_type == "q":
+        if agent_type in Q_LEARNING_AGENTS:
             print(
                 f"Weights: {weights_path if summary.weights_saved else 'not saved'}",
                 flush=True,
@@ -5905,9 +5948,12 @@ def parse_args(argv=None):
     parser.add_argument(
         "--agent",
         dest="agent_type",
-        choices=("q", "dqn"),
-        default="q",
-        help="Training backend (Q-learning remains the default).",
+        choices=AGENT_CHOICES,
+        default=DEFAULT_AGENT,
+        help=(
+            "Controller backend: q=basic Q-learning, dqn=Deep Q-Network, "
+            "qbt=Behavior Tree with Q-learning action nodes (default: qbt)."
+        ),
     )
     parser.add_argument("--trials", type=int, default=DEFAULT_TRIALS, help="Total number of training trials to run.")
     parser.add_argument("--survive", type=int, default=DEFAULT_SURVIVE, help="Number of top-performing trials to retain after each round.")
@@ -5916,7 +5962,7 @@ def parse_args(argv=None):
         "--weights",
         type=Path,
         default=None,
-        help="Checkpoint path (Q JSON weights or DQN .pt checkpoint).",
+        help="Learned-state file for the selected agent.",
     )
     parser.add_argument(
         "--dqn-updates-per-batch",
@@ -5929,7 +5975,7 @@ def parse_args(argv=None):
         type=int,
         default=None,
         help=(
-            "DQN only: begin in the variant phase with V1..N already unlocked "
+            "Begin in the variant phase with V1..N already unlocked "
             "(e.g. 4 resumes at V4). Does not mark N passed."
         ),
     )
@@ -6019,11 +6065,7 @@ def parse_args(argv=None):
     args = parser.parse_args(argv)
 
     if args.weights is None:
-        args.weights = (
-            DEFAULT_WEIGHTS_PATH
-            if args.agent_type == "q"
-            else DEFAULT_DQN_CHECKPOINT_PATH
-        )
+        args.weights = DEFAULT_AGENT_STATE_PATHS[args.agent_type]
     if args.workers < 1:
         parser.error("--workers must be at least 1")
     if args.dqn_updates_per_batch < 0:

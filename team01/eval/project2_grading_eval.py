@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Any, Callable, Optional
 
 if TYPE_CHECKING:
     from team01.agent.deep_q_learning import DeepQAgent
+    from team01.agent.q_learning import QBTAgent
 
 if __package__ in {None, ""}:
     _ROOT = Path(__file__).resolve().parents[2]
@@ -30,6 +31,16 @@ _BOMBERMAN = _ROOT / "Bomberman"
 if str(_BOMBERMAN) not in sys.path:
     sys.path.insert(0, str(_BOMBERMAN))
 
+from team01.project2.agent_backends import (
+    AGENT_CHOICES,
+    AGENT_LABELS,
+    DEFAULT_AGENT,
+    DEFAULT_AGENT_STATE_PATHS,
+    DEFAULT_QBT_WEIGHTS_PATH,
+    DEFAULT_Q_WEIGHTS_PATH,
+    Q_LEARNING_AGENTS,
+)
+
 RUNS_PER_VARIANT = 50
 DISPLAY = True
 SOLVED_THRESHOLD = 0.50
@@ -41,8 +52,7 @@ VARIANT_POINTS = {
     5: 35,
 }
 DEFAULT_MAP_PATH = _ROOT / "team01" / "project2" / "map.txt"
-DEFAULT_WEIGHTS_PATH = _ROOT / "team01" / "project2" / "q_learning_weights.json"
-DEFAULT_DQN_CHECKPOINT_PATH = DEFAULT_WEIGHTS_PATH.with_name("dqn_checkpoint.pt")
+DEFAULT_WEIGHTS_PATH = DEFAULT_Q_WEIGHTS_PATH
 RESULT_PATH = Path(__file__).resolve().parent / "results" / "project2_grading_eval.json"
 SPRITE_DIRECTORY = str(_BOMBERMAN / "sprites") + os.sep
 
@@ -133,15 +143,16 @@ class GradingBackend:
     agent_type: str
     checkpoint_path: Path
     weights: Optional[dict[str, float]]
-    agent_factory: Callable[[], QAgent | DeepQAgent]
+    agent_factory: Callable[[], QAgent | QBTAgent | DeepQAgent]
     canonical_snapshot: Optional[dict[str, Any]] = None
     canonical_agent: Optional[DeepQAgent] = None
 
 
-_WORKER_AGENT: Optional[QAgent | DeepQAgent] = None
+_WORKER_AGENT: Optional[QAgent | QBTAgent | DeepQAgent] = None
 _WORKER_WEIGHTS: Optional[dict[str, float]] = None
 _WORKER_TRIAL_RUNNER: Optional[Callable[..., GradingTrialResult]] = None
 _WORKER_DISPLAY = False
+_WORKER_AGENT_TYPE: Optional[str] = None
 
 
 def configure_runtime(display: bool) -> None:
@@ -174,15 +185,32 @@ def load_frozen_weights(weights_path: Path | str = DEFAULT_WEIGHTS_PATH) -> dict
     return dict(load_frozen_agent(weights_path).weights)
 
 
+def load_frozen_qbt_agent(weights_path: Path | str = DEFAULT_QBT_WEIGHTS_PATH) -> QBTAgent:
+    """Load the Q-learning Behavior Tree backend without enabling learning."""
+    path = Path(weights_path)
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"QBT learned weights not found: {path}. Train QBT or provide --weights; "
+            "grading evaluation will not fall back to untrained weights."
+        )
+    from team01.agent.q_learning import QBTAgent
+
+    agent = QBTAgent("me", "C", 0, 0)
+    agent.load_weights(str(path))
+    agent.set_learning(no_training=True, epsilon=0.0)
+    if agent.training or agent.epsilon != 0.0:
+        raise RuntimeError("Project 2 QBT agent did not enter frozen-policy mode")
+    return agent
+
+
 def _default_checkpoint_path(agent_type: str) -> Path:
-    if agent_type == "q":
-        return DEFAULT_WEIGHTS_PATH
-    if agent_type == "dqn":
-        return DEFAULT_DQN_CHECKPOINT_PATH
-    raise ValueError(f"unknown Project 2 agent type: {agent_type}")
+    try:
+        return DEFAULT_AGENT_STATE_PATHS[agent_type]
+    except KeyError as error:
+        raise ValueError(f"unknown Project 2 agent type: {agent_type}") from error
 
 
-def _assert_frozen_agent(agent: QAgent | DeepQAgent) -> None:
+def _assert_frozen_agent(agent: QAgent | QBTAgent | DeepQAgent) -> None:
     if agent.training or agent.epsilon != 0.0:
         raise RuntimeError("Project 2 grading trial did not start with a frozen policy")
     if isinstance(agent, QAgent):
@@ -199,29 +227,45 @@ def _assert_frozen_agent(agent: QAgent | DeepQAgent) -> None:
         raise RuntimeError("DQN grading agent must start with an empty replay buffer")
 
 
+def _frozen_q_agent_factory(
+    agent_type: str,
+    weights: dict[str, float],
+) -> Callable[[], QAgent | QBTAgent]:
+    from team01.agent.q_learning import QBTAgent
+
+    if agent_type not in Q_LEARNING_AGENTS:
+        raise ValueError(f"unknown Q-learning backend: {agent_type}")
+    agent_class = QBTAgent if agent_type == "qbt" else QAgent
+    canonical_weights = dict(weights)
+
+    def make_agent() -> QAgent | QBTAgent:
+        agent = agent_class("me", "C", 0, 0)
+        agent.weights = dict(canonical_weights)
+        agent.set_learning(no_training=True, epsilon=0.0)
+        return agent
+
+    return make_agent
+
+
 def _load_grading_agent(agent_type: str, checkpoint_path: Path) -> GradingBackend:
     """Load one canonical policy and provide fresh frozen agents for trials."""
-    if agent_type == "q":
+    if agent_type in Q_LEARNING_AGENTS:
+        load_agent = load_frozen_qbt_agent if agent_type == "qbt" else load_frozen_agent
         try:
-            canonical_agent = load_frozen_agent(checkpoint_path)
+            canonical_agent = load_agent(checkpoint_path)
         except (json.JSONDecodeError, UnicodeDecodeError) as error:
             raise ValueError(
-                f"QAgent checkpoint is not valid JSON: {checkpoint_path}. "
+                f"{AGENT_LABELS[agent_type]} weights are not valid JSON: "
+                f"{checkpoint_path}. "
                 "Use --agent dqn for a DQN checkpoint."
             ) from error
         weights = dict(canonical_agent.weights)
 
-        def make_q_agent() -> QAgent:
-            agent = QAgent("me", "C", 0, 0)
-            agent.weights = dict(weights)
-            agent.set_learning(no_training=True, epsilon=0.0)
-            return agent
-
         return GradingBackend(
-            agent_type="q",
+            agent_type=agent_type,
             checkpoint_path=checkpoint_path,
             weights=weights,
-            agent_factory=make_q_agent,
+            agent_factory=_frozen_q_agent_factory(agent_type, weights),
         )
 
     if agent_type == "dqn":
@@ -276,8 +320,8 @@ def _build_trial_game(
     variant: int,
     seed: int,
     weights: Optional[dict[str, float]],
-    agent_factory: Optional[Callable[[], QAgent | DeepQAgent]] = None,
-) -> tuple[Game, QAgent | DeepQAgent]:
+    agent_factory: Optional[Callable[[], QAgent | QBTAgent | DeepQAgent]] = None,
+) -> tuple[Game, QAgent | QBTAgent | DeepQAgent]:
     """Construct one clean Project 2 game and one clean frozen agent."""
     if variant not in VARIANT_BY_NUMBER:
         raise ValueError("Project 2 grading supports variants 1 through 5")
@@ -340,9 +384,11 @@ def run_trial(
     seed: int,
     weights: Optional[dict[str, float]] = None,
     display: bool = False,
-    game_builder: Optional[Callable[..., tuple[Any, QAgent | DeepQAgent]]] = None,
+    game_builder: Optional[
+        Callable[..., tuple[Any, QAgent | QBTAgent | DeepQAgent]]
+    ] = None,
     episode_runner: Optional[Callable[..., EpisodeResult]] = None,
-    agent_factory: Optional[Callable[[], QAgent | DeepQAgent]] = None,
+    agent_factory: Optional[Callable[[], QAgent | QBTAgent | DeepQAgent]] = None,
 ) -> GradingTrialResult:
     """Run one fresh-seed Project 2 game with a clean frozen agent."""
     if weights is None and agent_factory is None:
@@ -453,7 +499,7 @@ def evaluate_variant(
     weights: Optional[dict[str, float]],
     display: bool,
     trial_runner: Callable[..., GradingTrialResult] = run_trial,
-    agent_factory: Optional[Callable[[], QAgent | DeepQAgent]] = None,
+    agent_factory: Optional[Callable[[], QAgent | QBTAgent | DeepQAgent]] = None,
 ) -> dict[str, Any]:
     trials: list[dict[str, Any]] = []
     for run_number in range(1, runs + 1):
@@ -542,13 +588,17 @@ def _initialize_grading_worker(
 ) -> None:
     """Install one immutable per-process policy snapshot under spawn."""
     global _WORKER_AGENT, _WORKER_WEIGHTS, _WORKER_TRIAL_RUNNER, _WORKER_DISPLAY
+    global _WORKER_AGENT_TYPE
     configure_runtime(display)
     _WORKER_TRIAL_RUNNER = trial_runner
     _WORKER_DISPLAY = display
-    if agent_type == "q":
+    _WORKER_AGENT_TYPE = agent_type
+    if agent_type in Q_LEARNING_AGENTS:
         if weights is None:
-            raise ValueError("parallel Q grading requires loaded weights")
-        # Keep a process-local copy so trial agents cannot mutate canonical weights.
+            raise ValueError(
+                f"parallel {AGENT_LABELS[agent_type]} grading requires loaded weights"
+            )
+        # Spawn workers reconstruct QBT from the immutable canonical weight vector.
         _WORKER_WEIGHTS = dict(weights)
         _WORKER_AGENT = None
         return
@@ -570,8 +620,21 @@ def _initialize_grading_worker(
     _WORKER_WEIGHTS = None
 
 
-def _make_worker_trial_agent() -> QAgent | DeepQAgent:
+def _make_worker_trial_agent() -> QAgent | QBTAgent | DeepQAgent:
     """Return a new isolated frozen agent from the process-local snapshot."""
+    if _WORKER_AGENT_TYPE in Q_LEARNING_AGENTS:
+        from team01.agent.q_learning import QAgent, QBTAgent
+
+        if _WORKER_WEIGHTS is None:
+            raise RuntimeError(
+                f"parallel {_WORKER_AGENT_TYPE} worker has no initialized weight snapshot"
+            )
+        agent_class = QBTAgent if _WORKER_AGENT_TYPE == "qbt" else QAgent
+        agent = agent_class("me", "C", 0, 0)
+        agent.weights = dict(_WORKER_WEIGHTS)
+        agent.set_learning(no_training=True, epsilon=0.0)
+        _assert_frozen_agent(agent)
+        return agent
     if _WORKER_AGENT is None:
         raise RuntimeError("parallel DQN worker has no initialized policy")
     agent = copy.deepcopy(_WORKER_AGENT)
@@ -591,7 +654,7 @@ def _run_grading_task(task: GradingTrialTask) -> tuple[int, GradingTrialResult]:
         "weights": _WORKER_WEIGHTS,
         "display": _WORKER_DISPLAY,
     }
-    if _WORKER_AGENT is not None:
+    if _WORKER_AGENT is not None or _WORKER_AGENT_TYPE in Q_LEARNING_AGENTS:
         kwargs["agent_factory"] = _make_worker_trial_agent
     import torch
 
@@ -673,11 +736,11 @@ def run_evaluation(
     *,
     runs: int = RUNS_PER_VARIANT,
     display: bool = DISPLAY,
-    weights_path: Path | str = DEFAULT_WEIGHTS_PATH,
+    weights_path: Optional[Path | str] = None,
     output_path: Path | str = RESULT_PATH,
     trial_runner: Callable[..., GradingTrialResult] = run_trial,
-    agent_factory: Optional[Callable[[], QAgent | DeepQAgent]] = None,
-    agent_type: str = "q",
+    agent_factory: Optional[Callable[[], QAgent | QBTAgent | DeepQAgent]] = None,
+    agent_type: str = DEFAULT_AGENT,
     workers: int = 1,
     canonical_snapshot: Optional[dict[str, Any]] = None,
     seed_generator: Callable[[set[int]], int] = generate_seed,
@@ -691,7 +754,27 @@ def run_evaluation(
         raise ValueError("runs per variant must be at least 1")
     if workers < 1:
         raise ValueError("workers must be at least 1")
+    if agent_type not in AGENT_CHOICES:
+        raise ValueError(f"unknown Project 2 agent type: {agent_type}")
+    if weights_path is None:
+        weights_path = _default_checkpoint_path(agent_type)
     canonical_weights = dict(weights) if weights is not None else None
+    if agent_factory is None:
+        if agent_type in Q_LEARNING_AGENTS:
+            if canonical_weights is None:
+                backend = _load_grading_agent(agent_type, Path(weights_path))
+                canonical_weights = backend.weights
+                agent_factory = backend.agent_factory
+            else:
+                agent_factory = _frozen_q_agent_factory(
+                    agent_type,
+                    canonical_weights,
+                )
+        else:
+            backend = _load_grading_agent(agent_type, Path(weights_path))
+            agent_factory = backend.agent_factory
+            if canonical_snapshot is None:
+                canonical_snapshot = backend.canonical_snapshot
     used_seeds: set[int] = set()
     tasks = build_trial_plan(runs, used_seeds, seed_generator=seed_generator)
     planned_results: dict[int, GradingTrialResult] = {}
@@ -726,8 +809,6 @@ def run_evaluation(
             raise ValueError(
                 "parallel DQN grading requires the validated checkpoint snapshot"
             )
-        if agent_type not in {"q", "dqn"}:
-            raise ValueError(f"unknown Project 2 agent type: {agent_type}")
         pool_size = min(workers, len(tasks))
         # Spawn imports module-level workers afresh; pass snapshots, not live agents.
         with ProcessPoolExecutor(
@@ -809,6 +890,7 @@ def run_evaluation(
     total_wins = sum(summary["wins"] for summary in variants.values())
     solved_count = sum(summary["solved"] for summary in variants.values())
     result = {
+        "agent_type": agent_type,
         "weights_path": str(Path(weights_path).resolve()),
         "runs_per_variant": runs,
         "threshold": SOLVED_THRESHOLD,
@@ -825,7 +907,6 @@ def run_evaluation(
     if weights is not None and weights != canonical_weights:
         raise RuntimeError("Project 2 grading evaluation changed canonical weights")
     if agent_type == "dqn":
-        result["agent_type"] = "dqn"
         result["checkpoint"] = str(Path(weights_path).resolve())
     save_results(result, output_path)
     return result
@@ -861,13 +942,22 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         description=__doc__,
         epilog=(
             "Examples:\n"
+            "  python -m team01.eval.project2_grading_eval --agent qbt --workers 10\n"
             "  python -m team01.eval.project2_grading_eval --agent dqn --workers 10\n"
             "  python -m team01.eval.project2_grading_eval --agent dqn "
             "--weights team01/project2/dqn_checkpoint.pt --workers 10"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--agent", choices=("q", "dqn"), default="q")
+    parser.add_argument(
+        "--agent",
+        choices=AGENT_CHOICES,
+        default=DEFAULT_AGENT,
+        help=(
+            "Controller: q=basic Q-learning, dqn=Deep Q-Network, "
+            "qbt=Behavior Tree with Q-learning action nodes (default: qbt)."
+        ),
+    )
     parser.add_argument("--runs", type=int, default=RUNS_PER_VARIANT)
     parser.add_argument(
         "--workers",
@@ -903,8 +993,8 @@ def main(argv: Optional[list[str]] = None) -> dict[str, Any] | GradingTrialResul
     weights_path = Path(args.weights) if args.weights else _default_checkpoint_path(args.agent)
     print("PROJECT 2 GRADING EVALUATION")
     print(f"\nWeights: {weights_path.resolve()}")
+    print(f"Agent: {AGENT_LABELS[args.agent]}")
     if args.agent == "dqn":
-        print("Agent: DQN")
         print(f"Checkpoint: {weights_path.resolve()}")
     print("Mode: Frozen learned policy")
     print("Training: False")
@@ -917,6 +1007,11 @@ def main(argv: Optional[list[str]] = None) -> dict[str, Any] | GradingTrialResul
             raise FileNotFoundError(
                 f"DQN checkpoint not found: {weights_path}. "
                 "Train the DQN first or provide --weights <path>."
+            )
+        if args.agent == "qbt":
+            raise FileNotFoundError(
+                f"QBT learned weights not found: {weights_path}. "
+                "Train QBT first or provide --weights <path>."
             )
         raise FileNotFoundError(
             f"Project 2 learned weights not found: {weights_path}. Train or provide "

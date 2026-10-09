@@ -1,30 +1,19 @@
-# This is necessary to find the main code
+"""Standalone runner for Project 2 variant 2."""
+
 import sys
-sys.path.insert(0, '../../bomberman')
-sys.path.insert(1, '..')
+from pathlib import Path
 
-# Import necessary stuff
-import random
-from game import Game
-from monsters.stupid_monster import StupidMonster
+_ROOT = Path(__file__).resolve().parents[2]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
 
-# TODO This is your code!
-sys.path.insert(1, '../team01')
-from testcharacter import TestCharacter
 
-# Create the game
-random.seed(123) # TODO Change this if you want different random choices
-g = Game.fromfile('map.txt')
-g.add_monster(StupidMonster("stupid", # name
-                            "S",      # avatar
-                            3, 9      # position
-))
+from team01.project2.variant_runner import main_for_variant
 
-# TODO Add your character
-g.add_character(TestCharacter("me", # name
-                              "C",  # avatar
-                              0, 0  # position
-))
 
-# Run!
-g.go()
+def main(argv=None):
+    return main_for_variant(2, argv)
+
+
+if __name__ == "__main__":
+    main()

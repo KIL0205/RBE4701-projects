@@ -2,7 +2,7 @@ from abc import ABC, abstractmethod
 from enum import Enum, auto
 from typing import List, Optional
 
-from agent.black_board import BlackBoard
+from .black_board import BlackBoard
 
 
 class Status(Enum):

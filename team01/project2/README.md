@@ -1,89 +1,73 @@
-# Project 2: DQN training and grading
-Used AI to Generate this README 
+# Project 2 use
 
-## Architecture
+The are three agents are `q` (Q-learning),
+`qbt` (Behavior Tree with Q-learning action nodes), and `dqn` (Deep Q-Network).
+QBT is the default for training, grading, and standalone variants. 
 
-The DQN scores each legal action from an action-conditioned vector of 17
-features: QAgent's 16 shared features plus `direct_objective_progress`. A
-128-128 ReLU policy network estimates Q(s, a); a separate frozen target network
-provides bootstrap values. Parallel CPU workers receive immutable policy
-snapshots and return transitions. The parent is the canonical learner: it owns
-replay, Adam updates, target synchronization, curriculum decisions, and
-checkpoint writes.
+Each agent uses a separate learned-state file by default:
 
-## Setup
+- `q`: `team01/project2/q_learning_weights.json`
+- `qbt`: `team01/project2/q_learning_bt_weights.json`
+- `dqn`: `team01/project2/dqn_checkpoint.pt`
 
-From the repository root, install runtime and development dependencies:
-
-Windows:
+## Training
 
 ```powershell
-py -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install -r requirements-dev.txt
+python training.py --trials 10 --workers 4
+python training.py --agent q --trials 10
+python training.py --agent dqn --trials 10 --workers 4
 ```
 
-The runtime dependencies are `pygame`, `colorama`, and PyTorch;
+`--trials` sets episodes per training batch; `--workers` limits concurrent
+rollouts. Existing learned state is loaded and continued by default. Use
+`--fresh` to start from new state, `--weights PATH` to choose a state file, or
+`--start-variant 4` to resume training with V1–V4 unlocked and V4 as the current
+stage. DQN-only controls include `--dqn-learning-rate`, `--dqn-epsilon`, and
+`--dqn-updates-per-batch`.
 
-## Train
+## Grading Evaluation
 
 ```powershell
-python -m team01.project2.training --agent dqn --curriculum drills --workers 10 --trials 20 --survive 15 --eval-trials 20 --weights team01/project2/dqn_checkpoint.pt --guis 0
+python project2_grading_eval.py --runs 10 --workers 4 --no-display
+python project2_grading_eval.py --agent dqn --runs 10 --workers 4 --no-display
 ```
 
-The DQN checkpoint defaults to `team01/project2/dqn_checkpoint.pt`. If it
-exists, omitting `--fresh` loads its policy, target network, Adam state, and
-counters; replay starts empty and refills before updates resume. `--fresh`
-starts new networks and does not overwrite an existing checkpoint until a
-valid batch completes. `--trials` sets episodes per training batch; `--workers`
-sets maximum concurrent rollouts. The curriculum's `survive / trials`
-threshold is scaled to the newest variant's share of each mixed batch, so
-`--survive 15 --trials 20` sets a 75% stage threshold. This batch progression
-is distinct from final frozen evaluation, which requires at least 90% wins on
-every variant. Stagnation can trigger drill refreshes, but drills do not unlock
-variants.
+`--agent` accepts `q`, `qbt`, or `dqn` and defaults to `qbt`. `--runs` is the
+number of trials **per variant**; `--workers` limits concurrent workers and
+does not increase the number of trials. Grading uses a frozen policy. Use
+`--weights PATH` to select a learned-state file. 
 
-## Resume at a variant
+The program will automatically default to the appropriate weights based on the agent
+
+## Individual variants
+
+Run `variant1` through `variant5`; for example:
 
 ```powershell
-python -m team01.project2.training --agent dqn --start-variant 4 --workers 10 --trials 20 --survive 15 --weights team01/project2/dqn_checkpoint.pt
+python variant1.py
+python variant4.py --agent qbt --seed 12345
+python variant3.py --agent q --seed 12345
+python variant4.py --agent dqn --seed 12345
 ```
 
-`--start-variant 4` makes V1-V4 available and makes V4 the current newest
-training stage. V4 has **not** passed its stage threshold, and V5 remains
-locked. The checkpoint stores learner state, not curriculum position; use
-`--start-variant` to select the variant stage when resuming.
+Each runner accepts `--agent {q,qbt,dqn}`, `--weights PATH`, `--seed INT`,
+`--display`, and `--no-display`. An explicit seed makes the scenario
+reproducible and is independent of agent choice. If omitted, a random seed from
+0 through 1000 is generated and printed. Standalone variants use frozen agents
+and do not save learned state.
 
-## DQN overrides
 
-Use `--dqn-learning-rate` and `--dqn-epsilon` to override the run's learning
-rate and exploration rate. The learning-rate override is applied after loading
-the checkpoint because Adam restores its saved parameter-group settings; it
-changes the rate without resetting learned network parameters or Adam moments.
+## For Grading
+
+We would like you to use the defaults
 
 ```powershell
-python -m team01.project2.training --agent dqn --dqn-learning-rate 0.00005 --dqn-epsilon 0.05
+python variant1.py
+python variant2.py
+python variant3.py
+python variant4.py
+python variant5.py
 ```
 
-## Parallel grader
-
-```powershell
-python -m team01.eval.project2_grading_eval --agent dqn --weights team01/project2/dqn_checkpoint.pt --runs 20 --workers 10 --no-display
-```
-
-`--runs` is the number of episodes **per variant** (100 total for five
-variants); `--workers` limits concurrent worker processes and does not change
-the episode count. The parent assigns each episode a unique seed before
-dispatch, and results are restored to that planned order before scoring.
-Workers evaluate frozen policy copies and never train or save checkpoints.
-Use `--agent q` to grade the linear QAgent with
-`team01/project2/q_learning_weights.json`.
-
-## Checkpoints and tests
-
-DQN checkpoints atomically save policy and target parameters, Adam state,
-training counters, and feature-schema metadata. Replay is intentionally not
-saved. Checkpoints, `runs/`, training logs, and history files are generated
-local state and normally should not be committed.
-01/tests/test_project2_grading_parallel.py
-```
+Both QAgent and QBTAgent are trained past the full grading threshold.
+DeepQAgent either still needs more trainging or needs some tweaks for full functionality
