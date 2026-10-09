@@ -19,21 +19,21 @@
     "urgency_scaled_objective_progress"
   ],
   "weights": {
-    "q_bias": -289.8281249434307,
-    "win_next_update": 816.9080025027919,
-    "loss_next_update": -751.6636309099231,
-    "explosion_threat": -44.19956255847832,
-    "open_route_progress_gain": 470.6645249359161,
-    "breach_site_approach_gain": 0.9354634123658613,
-    "bomb_wall_route_gain": -9.202816531067562,
-    "monster_in_clear_blast_ray": -1.9133623796851345,
-    "bomb_escape_margin": 27.995934984610294,
-    "active_bomb_escape_margin": 4.552534726685702,
-    "unproductive_bomb": -27.40604896128444,
-    "safe_successor_fraction": 294.59733467443607,
-    "escape_route_diversity": -6.9770324947257905,
-    "monster_clearance": 23.81908332221956,
-    "monster_fuse_envelope_overlap": -13.479368728029026,
-    "urgency_scaled_objective_progress": 200.31762662886888
+    "q_bias": -33.65005081387008,
+    "win_next_update": 0.0,
+    "loss_next_update": 0.0,
+    "explosion_threat": 0.0,
+    "open_route_progress_gain": -0.1943921150869779,
+    "breach_site_approach_gain": 0.0,
+    "bomb_wall_route_gain": 0.0,
+    "monster_in_clear_blast_ray": 0.0,
+    "bomb_escape_margin": -0.5045472103647222,
+    "active_bomb_escape_margin": -1.2503756373027344,
+    "unproductive_bomb": 0.025201488622683156,
+    "safe_successor_fraction": -33.404978856431555,
+    "escape_route_diversity": -0.4280253198731964,
+    "monster_clearance": -33.645123415699615,
+    "monster_fuse_envelope_overlap": 0.0,
+    "urgency_scaled_objective_progress": -0.09720288698294272
   }
 }

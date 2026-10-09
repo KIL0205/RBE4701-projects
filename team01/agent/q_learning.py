@@ -19,15 +19,16 @@ from .evaluation import (
     profiles_from_mapping,
     q_feature_names,
 )
-from .safety import find_executable_exit_action, legal_candidate_actions, monster_threat_cells, assess_immediate_safety
+from .safety import find_executable_exit_action, legal_candidate_actions, monster_immediate_reachable_cells, monster_threat_cells, assess_immediate_safety
 from .world_model import WorldModel
 
 class QAgent(CharacterEntity):
     # rewards
-    R_WIN = 1000.0
-    R_LOSE = -1000.0
+    R_WIN = 2000.0
+    R_LOSE = -2000.0
     R_COST_OF_LIVING = -0.1
-    R_NEAR_MONSTER = 0.0 ## TODO: try teensy tiny -0.1 reward on this
+    R_ESCAPE_MONSTER = 0.0 #25 # NOTE: TESTING
+    R_SAFE_ROUTE = 0.0 #25 # NOTE: TESTING
     R_STEP = 0.0
     R_KILL_MONSTER = 0.0
     R_BREAK_WALL = 0.0
@@ -39,7 +40,7 @@ class QAgent(CharacterEntity):
     #     eligible: bool
     #     rejection_reason: str
 
-    def __init__(self, name, avatar, x, y, alpha: float = 0.0005, gamma: float = 0.9, epsilon: float = 0.05):
+    def __init__(self, name, avatar, x, y, alpha: float = 0.0001, gamma: float = 0.9, epsilon: float = 0.05):
         super().__init__(name, avatar, x, y)
         
         ## behavior tree
@@ -143,7 +144,7 @@ class QAgent(CharacterEntity):
         ):
             reward = self.calc_reward(self.prev_model, current_model, self.prev_action)
             next_max_q, _ = self.max_q_value(wrld, actions)
-            previous_q = self.get_q_value(self.prev_features)
+            previous_q = self.get_q_value(self.prev_features) # NOTE: could prob speed up by saving prev_q value
             target = reward + self.gamma * next_max_q
             td_error = self.update(self.prev_features, reward, next_max_q)
             self._record_learning_diagnostics(self.prev_features, td_error)
@@ -489,9 +490,32 @@ class QAgent(CharacterEntity):
         reward += self.R_COST_OF_LIVING # minor cost for staying alive
 
         # other costs:
-        if current_position is not None and current_position in monster_threat_cells(current, 2):
-            # within possible chasing distance of monster
-            reward += self.R_NEAR_MONSTER # medium cost for being in danger
+        prev_monster_reach =  monster_immediate_reachable_cells(previous)
+        curr_monster_reach = monster_immediate_reachable_cells(current)
+        future_monster_reach = monster_threat_cells(current)
+
+        def calc_dist_to_monster(pos, monster_pos) -> float:
+            return max(abs(pos[0] - monster_pos[0]), abs(pos[1] - monster_pos[1]))
+        
+        def avg(values) -> float:
+            if not values:
+                return 0.0
+            return sum(values) / len(values)
+
+        curr_monster_dist = min([calc_dist_to_monster(current_position, monster_pos) for monster_pos in curr_monster_reach]) if len(current.monster_positions()) > 0 else 0
+        prev_monster_dist = min([calc_dist_to_monster(previous_position, monster_pos) for monster_pos in prev_monster_reach]) if len(previous.monster_positions()) > 0 else 0
+        d_monster_dist = curr_monster_dist - prev_monster_dist
+        if d_monster_dist < 3:
+            # reward for moving further from monsters
+            reward += self.R_ESCAPE_MONSTER * d_monster_dist
+            if (current_position not in curr_monster_reach and previous_position in prev_monster_reach):
+                mult = 1.0 if current_position not in future_monster_reach else 0.5
+                reward += self.R_ESCAPE_MONSTER * mult ## additional reward for escaping the chase
+        
+        # reward for taking safe routes
+        safe_routes_fraction = self.prev_features.get("safe_successor_fraction")
+        if safe_routes_fraction is not None:
+            reward += self.R_SAFE_ROUTE * safe_routes_fraction
 
         if (
             previous_position is not None
@@ -504,7 +528,7 @@ class QAgent(CharacterEntity):
             if dist_to_exit < prev_dist_to_exit:
                 reward += self.R_STEP # medium reward for getting closer to exit
 
-        # if monster dead, +20
+        # if monster dead
         if len(current.monsters) < len(previous.monsters):
             reward += self.R_KILL_MONSTER # high reward for killing a monster
 

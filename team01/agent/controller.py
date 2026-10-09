@@ -591,6 +591,7 @@ class QLearningRootController:
         future_danger_branch = SequenceNode("future_danger", blackboard)
         future_danger_branch.add_child(Q_IsDangerSoon(blackboard))
         future_danger_branch.add_child(Q_AvoidThreatMoveSet(blackboard, profiles["emergency"]))
+        ## add another danger fallback?
 
         safety_selector.add_child(imediate_danger_branch)
         safety_selector.add_child(future_danger_branch)

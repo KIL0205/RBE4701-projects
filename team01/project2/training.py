@@ -256,10 +256,18 @@ def drill_progression() -> tuple[Drill, ...]:
         ),
         Drill(
             4,
-            "Breach and Avoid",
+            "Breach and Avoid Stupid Monster",
             DRILL_MAP_DIRECTORY / "d4_breach_and_avoid.txt",
-            "Breach the wall, escape the blast, avoid a monster, and reach the exit.",
+            "Breach the wall, escape the blast, avoid a stupid monster, and reach the exit.",
             (MonsterConfig("stupid", "drill-monster", "S", 7, 6),),
+            breach_target=(4, 4),
+        ),
+        Drill(
+            5,
+            "Breach and Avoid Aggressive Monster",
+            DRILL_MAP_DIRECTORY / "d4_breach_and_avoid.txt",
+            "Breach the wall, escape the blast, avoid an aggressive monster, and reach the exit.",
+            (MonsterConfig("smart", "drill-monster", "A", 7, 6, 2),),
             breach_target=(4, 4),
         ),
     )
@@ -4522,7 +4530,9 @@ def parse_args(argv=None):
 def main(argv=None) -> TrainingSummary:
     """Run progressive training with the parsed command-line options."""
     args = parse_args(argv)
-    return run_progressive_training(
+    start_time = time.time()
+
+    summary = run_progressive_training(
         trials=args.trials,
         survive=args.survive,
         seed=args.seed,
@@ -4545,6 +4555,17 @@ def main(argv=None) -> TrainingSummary:
         drill_refresh_trials=args.drill_refresh_trials,
         worker_details=args.worker_details,
     )
+    
+    end_time = time.time()
+    elapsed_seconds = int(end_time - start_time)
+    hours, remainder = divmod(elapsed_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+
+    print(f"Training started: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(start_time))}")
+    print(f"Training ended:   {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(end_time))}")
+    print(f"Elapsed time: {hours:02}:{minutes:02}:{seconds:02}")
+
+    return summary
 
 
 if __name__ == "__main__":
